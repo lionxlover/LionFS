@@ -1,0 +1,9 @@
+# Build defaults for LionFS 2.0.
+
+[target.x86_64-pc-windows-msvc]
+# Windows needs no special flags; the PAL is raw FFI, zero crates.
+
+# Convenience aliases (cargo r / cargo urun)
+[alias]
+ltest = "test --features io_uring"
+lclippy = "clippy --lib --bins --features io_uring -- -D warnings"

@@ -1,0 +1,11 @@
+compress: mixed corpus (40% repeating / 35% dictionary text / 25% PRNG), 8 MiB logical (2048 blocks)
+compress: zstd level 3 (mount_lfs -o zstd_level=N)
+  write :   185.6 MiB/s   (0.04 s)
+  space :     706 physical blocks for 2048 logical -> ratio 2.90x (34.5% of original)
+  read  :   805.3 MiB/s   (0.01 s, byte-identical round-trip verified)
+  r4k-rd:   26643 ops/s   (4 KiB reads through the 2 MiB decompressed-cluster LRU)
+  level sweep (ratio, write MiB/s):
+    level  1: ratio  2.86x   write   475.5 MiB/s
+    level  3: ratio  2.90x   write   406.6 MiB/s
+    level  6: ratio  2.96x   write   104.8 MiB/s
+    level  9: ratio  2.98x   write    60.0 MiB/s

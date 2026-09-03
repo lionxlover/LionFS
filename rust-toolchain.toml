@@ -1,0 +1,5 @@
+[toolchain]
+# The floor is rust-version = "1.75" in Cargo.toml; CI and dev use
+# current stable. Nightly is exercised by the canary workflow only.
+channel = "stable"
+profile = "default"

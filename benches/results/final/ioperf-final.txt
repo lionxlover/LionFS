@@ -1,0 +1,18 @@
+lfs_ioperf: in-process LionFS I/O-core benchmark
+  image        : /tmp/lfs_ioperf_27295_dev0.img (scratch)
+  region       : 8192 blocks (32 MiB), 4 KiB units
+  pattern note : user-space CPU cost of the I/O path; NOT comparable
+                 to fio-on-mount numbers (no FUSE, no page cache, no syscalls)
+  checksums    : on (XxHash64 per block, checksum tree)
+  harness      : tx-buffered (like the FUSE path between fsyncs), one
+                 tx per group; images are scratch and never committed
+
+  pattern                 MiB/s      ops/s       bytes  extents fragments
+  seq4k-write-fresh       560.5     143479    33554432        7         8
+  seq4k-write            1030.6     263835  3242004480        7         7
+  seq4k-read             1446.2     370237  4549472256        7         7
+  seq64k-write-fresh      840.4      13446    33554432        7         8
+  seq64k-write           1046.7      16747  3292659712        7         7
+  seq64k-read            1427.1      22834  4489347072        7         7
+  rand4k-read            1328.8     340175  4180070400        7         8
+  rand4k-write            837.4     214384  2634350592        7      8191

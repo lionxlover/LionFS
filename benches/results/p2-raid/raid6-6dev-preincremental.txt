@@ -1,0 +1,15 @@
+pool: raid6 x 6 devices, chunk 32 blocks (128 KiB), per-device 65536 blocks
+  parity: parity writes: 25508 total, 25508 partial-chunk (100.0%), 76524 stripe-row reads (3.00 per write)
+lfs_ioperf: in-process LionFS I/O-core benchmark
+  image        : /tmp/lfs_ioperf_7027_dev0.img (scratch)
+  region       : 8192 blocks (32 MiB), 4 KiB units
+  pattern note : user-space CPU cost of the I/O path; NOT comparable
+                 to fio-on-mount numbers (no FUSE, no page cache, no syscalls)
+  checksums    : on (XxHash64 per block, checksum tree)
+  harness      : tx-buffered (like the FUSE path between fsyncs), one
+                 tx per group; images are scratch and never committed
+
+  pattern                 MiB/s      ops/s       bytes  extents fragments
+  raid-write-fresh        753.6      12057    33554432        7         8
+  raid-commit              29.4          1    33554432        0         0
+  raid-read-back          775.5      12408    33554432        7         7

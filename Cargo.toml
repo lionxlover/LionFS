@@ -1,0 +1,269 @@
+[package]
+name = "lionfs"
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Lion"]
+description = "LionFS 2.0: line-rate, media-aware, self-healing universal file system (cross-platform: Linux, macOS, Windows)"
+repository = "https://example.invalid/lionfs"
+license = "MIT OR Apache-2.0"
+keywords = ["filesystem", "storage", "io-uring", "fuse", "zns"]
+categories = ["filesystem", "os"]
+
+[lib]
+name = "lionfs_core"
+path = "src/lib.rs"
+
+# ---------------------------------------------------------------------------
+# Platform-scoped dependencies.
+#
+# LionFS 2.0 targets Linux, macOS and Windows from one code base. The core
+# engine is pure Rust; everything platform-specific is either a std API
+# behind the `pal` module or one of the small target-scoped dependency sets
+# below. Notably the Windows build needs NO external crates: the pal layer
+# reaches DeviceIoControl / FlushFileBuffers / ProcessPrng through raw
+# `extern "system"` FFI, so the dependency graph on Windows is std-only.
+# ---------------------------------------------------------------------------
+# POSIX platforms (Linux, macOS, BSDs): FUSE mounting (Linux fuse / macOS
+# macFUSE via fuser 0.12) and the libc errno/ioctl/fcntl surface.
+[target.'cfg(unix)'.dependencies]
+fuser = { version = "0.12", default-features = false, features = ["abi-7-10"] }
+libc = "0.2"
+
+# Linux-only: the io_uring submission plane (Pillar I, RFC-002 §3.1).
+# Optional -- the engine degrades to the portable threaded backend when the
+# feature is off, when the kernel refuses io_uring_setup, or when the ring
+# is otherwise unavailable at runtime.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
+
+[features]
+default = []
+# Linux io_uring I/O engine backend (LFS-RFC-002 Pillar I).
+io_uring = ["dep:io-uring"]
+
+[dependencies]
+bytemuck = { version = "1.14", features = ["derive", "min_const_generics"] }
+crc32fast = "1.3"
+blake3 = "1.5"
+chacha20poly1305 = "0.10"
+aes-gcm = "0.10"
+lz4_flex = "0.11"
+zstd = "0.13"
+flate2 = "1.0"
+log = "0.4"
+env_logger = "0.10"
+moka = { version = "0.12", features = ["sync"] }
+crossbeam = "0.8"
+xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
+sha2 = "0.10"
+rayon = "1.8"
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.4"
+tempfile = "3.10"
+
+[[bin]]
+name = "mkfs_lfs"
+path = "tools/mkfs/main.rs"
+
+[[bin]]
+name = "mount_lfs"
+path = "userspace/cli/mount.rs"
+
+[[bin]]
+name = "debug-lfs"
+path = "tools/inspect/main.rs"
+
+[[bin]]
+name = "bench-lfs"
+path = "tools/bench/main.rs"
+
+[[bin]]
+name = "lfs_stress"
+path = "tools/stress/main.rs"
+
+[[bin]]
+name = "lfs_snapshot"
+path = "tools/snapshot/main.rs"
+
+[[bin]]
+name = "lfs_clone"
+path = "tools/clone/main.rs"
+
+[[bin]]
+name = "lfs_volume"
+path = "tools/volume/main.rs"
+
+[[bin]]
+name = "lfs_upgrade"
+path = "tools/upgrade/main.rs"
+
+[[bin]]
+name = "lfs_admin"
+path = "tools/admin/main.rs"
+
+[[bin]]
+name = "lfs_verify"
+path = "tools/verify/main.rs"
+
+[[bin]]
+name = "lfs_repair"
+path = "tools/repair/main.rs"
+
+[[bin]]
+name = "lfs_debug"
+path = "tools/debug/main.rs"
+
+[[bin]]
+name = "lfs_dump"
+path = "tools/dump/main.rs"
+
+[[bin]]
+name = "lfs_benchmark"
+path = "tools/benchmark/main.rs"
+
+[[bin]]
+name = "lfs_monitor"
+path = "tools/monitor/main.rs"
+
+[[bin]]
+name = "lfs_compress"
+path = "tools/compress/main.rs"
+
+[[bin]]
+name = "lfs_dedupe"
+path = "tools/dedupe/main.rs"
+
+[[bin]]
+name = "lfs_encrypt"
+path = "tools/encrypt/main.rs"
+
+[[bin]]
+name = "lfs_keys"
+path = "tools/keys/main.rs"
+
+[[bin]]
+name = "lfs_security"
+path = "tools/security/main.rs"
+
+[[bin]]
+name = "lfs_optimize"
+path = "tools/optimize/main.rs"
+
+[[bin]]
+name = "lfs_scrub"
+path = "tools/scrub/main.rs"
+
+[[bin]]
+name = "lfs_pool"
+path = "tools/pool/main.rs"
+
+[[bin]]
+name = "lfs_device"
+path = "tools/device/main.rs"
+
+[[bin]]
+name = "lfs_raid"
+path = "tools/raid/main.rs"
+
+[[bin]]
+name = "lfs_rebuild"
+path = "tools/rebuild/main.rs"
+
+[[bin]]
+name = "lfs_replicate"
+path = "tools/replicate/main.rs"
+
+[[bin]]
+name = "lfs_balance"
+path = "tools/balance/main.rs"
+
+[[bin]]
+name = "lfs_failover"
+path = "tools/failover/main.rs"
+
+[[bin]]
+name = "lfs_telemetry"
+path = "tools/telemetry/main.rs"
+
+[[bin]]
+name = "lfs_analyze"
+path = "tools/analyze/main.rs"
+
+[[bin]]
+name = "lfs_predict"
+path = "tools/predict/main.rs"
+
+[[bin]]
+name = "lfs_report"
+path = "tools/report/main.rs"
+
+[[bin]]
+name = "lfs_recommend"
+path = "tools/recommend/main.rs"
+
+[[bin]]
+name = "lfs_policy"
+path = "tools/policy/main.rs"
+
+[[bin]]
+name = "lfs_scheduler"
+path = "tools/scheduler/main.rs"
+
+[[bin]]
+name = "lfs_profile"
+path = "tools/profile/main.rs"
+
+[[bin]]
+name = "lfs_health"
+path = "tools/health/main.rs"
+
+[[bin]]
+name = "lfs_ioperf"
+path = "tools/ioperf/main.rs"
+
+# --- 2.0 tooling -------------------------------------------------------------
+
+[[bin]]
+name = "lfs_palinfo"
+path = "tools/palinfo/main.rs"
+
+[[bin]]
+name = "lfs_engine"
+path = "tools/engine/main.rs"
+
+[[bin]]
+name = "lfs_zns"
+path = "tools/zns/main.rs"
+
+[[bench]]
+name = "btree_bench"
+harness = false
+
+[[bench]]
+name = "allocator_bench"
+harness = false
+
+[[bench]]
+name = "io_bench"
+harness = false
+
+[[bench]]
+name = "beepsilon_bench"
+harness = false
+
+[[bench]]
+name = "fastcdc_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"

@@ -1,0 +1,7 @@
+[
+  {"pattern": "seq-write-fresh", "mib_per_s": 510.46, "ops_per_s": 130678, "bytes": 33554432, "secs": 0.063, "extents": 7, "spilled": true, "checksums": true},
+  {"pattern": "seq-write", "mib_per_s": 889.94, "ops_per_s": 227826, "bytes": 4665872384, "secs": 5.000, "extents": 7, "spilled": true, "checksums": true},
+  {"pattern": "seq-read", "mib_per_s": 1145.74, "ops_per_s": 293310, "bytes": 6006996992, "secs": 5.000, "extents": 7, "spilled": true, "checksums": true},
+  {"pattern": "rand4k-read", "mib_per_s": 1110.78, "ops_per_s": 284359, "bytes": 5823672320, "secs": 5.000, "extents": 7, "spilled": true, "checksums": true},
+  {"pattern": "rand4k-write", "mib_per_s": 815.29, "ops_per_s": 208715, "bytes": 4274479104, "secs": 5.000, "extents": 7, "spilled": true, "checksums": true}
+]
