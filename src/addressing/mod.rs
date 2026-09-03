@@ -23,9 +23,11 @@
 
 pub mod extent16;
 pub mod va;
+pub mod va256;
 
 pub use extent16::{Extent16, ExtentFlags};
 pub use va::VolumeAddr;
+pub use va256::{CapacityPlane, WideAddr};
 
 /// The unit of the `device_lba` field: 4 KiB blocks, matching the 1.x
 /// format's `BLOCK_SIZE` so the two address spaces interoperate.

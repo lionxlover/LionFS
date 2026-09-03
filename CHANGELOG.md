@@ -4,6 +4,131 @@ All notable changes to the LionFS project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - The Unlimited Release (LFS-RFC-004)
+
+Eleven production-blocker subsystems from the 3.0 gap analysis, all
+implemented as consultative policy layers over the unchanged 2.0
+substrate. Test suite: 462 → **638** (all green, with and without
+`io_uring`).
+
+### Added — Capacity plane (`src/addressing/va256.rs`)
+- **256-bit `WideAddr`** (RFC-004 §3): opt-in mkfs-time namespace width
+  for fabric pools — domain(24)/namespace(24)/volume(32)/region(32)/
+  device(32)/LBA(48)/byte-offset(64) field layout, field-order `Ord`,
+  lossless `From<VolumeAddr>` embedding with `try_compact` inversion.
+- `CapacityPlane` selector with stable superblock `plane` tags
+  (Compact=0/Wide=1); mount refuses unknown planes.
+
+### Added — QoS & multi-tenancy (`src/qos/`)
+- 24 IO priority slots (Realtime/BestEffort/Bulk × 8 sub-levels,
+  level-major).
+- **Dual token buckets** (bytes/s + ops/s, burst caps, lazy integer
+  refill against caller-supplied time; zero rates rejected).
+- **Per-namespace quotas**: soft/hard space+inode limits, grace
+  windows, bounded denial ring (1024), evaluate-then-charge protocol.
+- **WFQ in virtual time**: declared-cost finish times (idempotent
+  while pending — anti-laundering), monotonic virtual clock,
+  tie-break by queue index. Property tests: exact alternation,
+  64K-vs-4K amortization (16:1), 1:3 weights → ~3:1 service.
+
+### Added — Small-file record journal (`src/recordlog/`)
+- ≤4032 B writes batch into one sequential log write: 40-byte header
+  + payload + CRC32, types Create/Data/Delete/Truncate/Commit/
+  Checkpoint; `Commit` = durability point, `Checkpoint` carries the
+  drained-through watermark.
+- Torn-tail vs corrupt-header replay distinction; CRC failure stops
+  replay; hard payload-size enforcement before bytes touch the sink.
+- Checkpoint policy: byte/record budgets + chatty-burst detection.
+
+### Added — Copy-GC (`src/gc/`)
+- Rosenblum-Ousterhout cost/benefit planner extended with wear
+  leveling (5 bps/100 cycles) and an age prior (7-day half-life).
+- Watermarks: idle ≥20% free, background 20→8%, **panic mode** <8%
+  (pure freeable-bytes ordering); plans capped at 8 segments with
+  deterministic tiebreak; all-live pools return `None` honestly.
+- `ReclaimEvent` census updates (refcount drops feed the planner
+  without device rescans).
+
+### Added — Guardian, autonomous operations (`src/guardian/`)
+- **Ransomware entropy watch**: integer Shannon entropy (256-symbol,
+  16-step quantized log2), rewrite-fraction and lure-extension EWMAs,
+  weights 0.5/0.3/0.2, freeze line at 8000 bps — compression
+  workloads cap at 5000 (never freeze), encrypt-in-place reaches the
+  line in ~6 windows.
+- **Drive-failure predictor**: Weibull baseline (k=1.30, η=80 kh) ×
+  SMART-telemetry multipliers; risk bands Healthy/Watch/Degraded/
+  Failing; median-remaining-life point estimate (days for Failing,
+  weeks for Degraded). Age modulates remaining life only — telemetry
+  drives alarms.
+- **Workload classifier**: EWMA moments → Db/Log/Stream/Meta/Vm/Vhost
+  cascade feeding policy retunes.
+- **Agent & advisory bus**: bounded ring, escalation-safe rate
+  limiting (keys carry band/class so a worse verdict is never
+  suppressed), reversible actions only (FreezeSnapshots/
+  EscalateScrub/PlanMigration/RetunePolicies). Runs strictly
+  out-of-band — the data path stays deterministic.
+
+### Added — Observability (`src/telemetry/prometheus.rs`)
+- Dependency-free Prometheus text exposition (format 0.0.4): HELP/
+  TYPE, label escaping, deterministic family/label ordering.
+- 49-bucket log-linear latency histograms (1 µs → 36 min + Inf) with
+  cumulative `_bucket{le}`/`_sum`/`_count`; interpolated quantiles;
+  saturating counters/gauges; `Rc<Handle>` cells (one RefCell borrow
+  per observe on the completion path).
+
+### Added — Migration (`src/migrate/`)
+- 10-rule magic-byte detection: ext4/XFS/Btrfs/ZFS/F2FS/NTFS/FAT32/
+  exFAT/HFS+/APFS at documented offsets (first-match-wins, bounds-
+  safe on short images).
+- **Manifest protocol**: (path, size, SHA-256) ledger; verification
+  distinguishes extra/missing/size-mismatch/digest-mismatch;
+  `is_complete()` = zero failures ∧ all checked.
+- Import planner: tar-stream (default) / per-file (NTFS ADS, HFS+
+  forks, APFS forks) / raw-block (unmountable, operator sign-off
+  required); bounded progress steps; destination size as a range.
+
+### Added — Container/VM awareness (`src/container/`)
+- Image-layer CAS: digest-keyed registration, refcounted re-pulls
+  (`saved_bytes` accounting), hot-dedup-index pinning, sharing ratio
+  export, sweep-after-GC.
+- Virtiofs passthrough policy table: host-path → tag with cache model
+  (none/auto/always), DAX, identity squash; tag collisions refused.
+
+### Added — Key management (`src/security/kdf.rs`)
+- **PBKDF2-HMAC-SHA256** (hand-rolled over sha2, RFC 8018, 600k
+  default iterations, known-answer tested) → KEK; volume master
+  wrapped via ChaCha20-Poly1305.
+- Per-file keys = HMAC-PRF under a versioned domain tag — **re-key
+  and passphrase rotation are metadata-only**.
+- Volatile-zeroizing master on drop (no `zeroize` crate; Windows
+  stays std-only); `KeyEnvelope` is deliberately not `Debug`.
+
+### Added — Retention & pool evolution
+- **GFS snapshot retention** (`src/fs/retention.rs`): 24h/14d/8w/12m/
+  3y budgets, additive representative selection, integer Hinnant
+  civil calendar + ISO-8601 week keys (2020-W53 edge tested).
+- **Online rebalance** (`src/pool/rebalance.rs`):
+  capacity-proportional targets, health-discounted evacuation
+  (Watch −25%/Degraded −50%/Failing = drain), drain-to-remove with
+  completion reports, 1 GiB budgeted moves on the CoW path in the
+  Bulk class, `is_balanced()` convergence (property-tested).
+
+### Added — Tooling
+- `lfs_guardian sim` (full advisory pipeline demo), `lfs_migrate
+  demo|detect|plan`, `lfs_gc sim` (watermark bands + wear demo),
+  `lfs_retention sim` (GFS verdicts over synthetic history).
+
+### Changed
+- Cargo: version 3.0.0; description carries the 3.0 feature set.
+- RFC-004 (`docs/rfc/LFS-RFC-004-unlimited.md`) is normative for all
+  of the above; 10 new specification files under `specifications/`.
+- The 3.0 modules follow the 2.0 determinism rule: no wall clock
+  inside policy objects (caller-supplied time everywhere).
+
+### Fixed
+- 2.0's unused `Read` import in `security::encryption.rs` (warning
+  hygiene during the 3.0 audit pass).
+
 ## [2.0.0] - The Cross-Platform Architecture Release (LFS-RFC-002 + LFS-RFC-003)
 
 ### Added — Platform Abstraction Layer (`src/pal/`)

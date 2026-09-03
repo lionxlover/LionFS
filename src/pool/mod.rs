@@ -4,6 +4,7 @@ pub mod gf256;
 pub mod health;
 pub mod manager;
 pub mod raid;
+pub mod rebalance;
 pub mod recovery;
 pub mod replication;
 

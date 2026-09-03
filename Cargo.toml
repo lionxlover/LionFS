@@ -1,10 +1,10 @@
 [package]
 name = "lionfs"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Lion"]
-description = "LionFS 2.0: line-rate, media-aware, self-healing universal file system (cross-platform: Linux, macOS, Windows)"
+description = "LionFS 3.0: line-rate, media-aware, self-healing universal file system with QoS, Guardian AI ops, unlimited-capacity addressing (cross-platform: Linux, macOS, Windows)"
 repository = "https://example.invalid/lionfs"
 license = "MIT OR Apache-2.0"
 keywords = ["filesystem", "storage", "io-uring", "fuse", "zns"]
@@ -237,6 +237,24 @@ path = "tools/engine/main.rs"
 [[bin]]
 name = "lfs_zns"
 path = "tools/zns/main.rs"
+
+# --- 3.0 tooling -------------------------------------------------------------
+
+[[bin]]
+name = "lfs_guardian"
+path = "tools/guardian/main.rs"
+
+[[bin]]
+name = "lfs_migrate"
+path = "tools/migrate/main.rs"
+
+[[bin]]
+name = "lfs_gc"
+path = "tools/gc/main.rs"
+
+[[bin]]
+name = "lfs_retention"
+path = "tools/retention/main.rs"
 
 [[bench]]
 name = "btree_bench"
