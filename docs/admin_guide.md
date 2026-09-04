@@ -43,3 +43,78 @@ All tools support standard POSIX CLI flags and output strictly deterministic JSO
 - `lfs_dump`: Dumps the Superblock and WAL journal for crash investigations.
 - `lfs_profile`: Attaches to the userspace process to extract performance flame graphs.
 - `lfs_benchmark`: A built-in Criterion/FIO-style benchmarking utility to validate IOPS scalability directly against the storage medium.
+
+## 8. Volume Lifecycle Workflow
+
+The 25 binaries above form a pipeline, not a menu. The minimal
+production sequence from a blank device to a self-maintaining volume,
+with the repair tools on standby:
+
+```mermaid
+flowchart TB
+    MK["mkfs_lfs - format and self-checksum"] --> MO["mount_lfs - FUSE attach"]
+    MO --> SNAP["lfs_snapshot - CoW read-only point"]
+    SNAP --> CLONE["lfs_clone - promote writable clone"]
+    MO --> GC["lfs_gc - copy-GC census and evacuate"]
+    MO --> SCRUB["lfs_scrub - CRC32 BLAKE3 verify and heal"]
+    SCRUB --> VERIFY["lfs_verify - B+Tree and orphan audit"]
+    VERIFY --> REPAIR["lfs_repair - offline metadata recovery"]
+    MO --> TELE["lfs_telemetry - IOPS and cache stats"]
+    TELE --> PRED["lfs_predict - 24h cache models"]
+    PRED --> REC["lfs_recommend - tuning advice"]
+    REC --> SCHED["lfs_scheduler - background priorities"]
+```
+
+`lfs_gc` and `lfs_retention` below are 3.x-era tools added beyond the
+25 binaries of sections 1-7, alongside `lfs_guardian`, `lfs_migrate`,
+and the 3.1 `lfs_simulate`.
+
+Mount is not a single call. `mount_lfs` drives the five-state recovery
+machine (PROBE, REPLAY, CHECKPOINT, RECONCILE, WRITABLE) before the
+first operation is accepted:
+
+```mermaid
+sequenceDiagram
+    participant A as admin
+    participant M as mount_lfs
+    participant R as recovery machine
+    participant J as WAL journal
+    A->>M: mount request
+    M->>R: PROBE primary then mirror superblock
+    R->>J: REPLAY committed generation
+    J-->>R: torn tail detected and discarded
+    R->>R: CHECKPOINT root swap
+    R->>R: RECONCILE orphans and refcounts
+    R-->>M: WRITABLE
+    M-->>A: mount ready
+```
+
+### GC and retention arithmetic (3.1)
+
+Pool utilization is $\rho = L/C$, with $L$ live bytes and $C$ pool
+capacity. The 3.1 copy-GC daemon kicks at $\rho > 0.25$ and exits
+aggressive mode at $\rho < 0.10$; the transient runway those watermarks
+buy is
+
+$$t_{\mathrm{panic}} = \frac{0.25 - 0.10}{f - r}$$
+
+where $f$ is the fill rate and $r$ the reclaim rate. Retention keeps
+one representative snapshot per GFS tier -- 48 hourly, 14 daily, 8
+weekly, 12 monthly, 7 yearly -- so a fully populated tree holds
+
+$$N_{\mathrm{GFS}} = 48 + 14 + 8 + 12 + 7 = 89$$
+
+snapshot points, each created by `lfs_snapshot` and expired by
+`lfs_retention`.
+
+### Crash drills: lfs_simulate (3.1)
+
+`lfs_simulate run | sweep | determinism` drives the deterministic crash
+simulator (`src/sim/`): seeded universes, power cuts at deterministic
+op indexes and tear offsets, and replay invariants asserted after
+every cut. The exhaustive sweep makes every crash point a test case:
+
+$$N_{\mathrm{universes}} = |\mathrm{seeds}| \times N_{\mathrm{ops}} \times |\mathrm{tear\ offsets}|$$
+
+That machinery is part of what took the suite to 713 green tests; run
+a sweep before and after any storage-stack change.

@@ -44,3 +44,52 @@ ext4/XFS/Btrfs/ZFS configured identically on the same hardware, same
 run; report throughput and P99/P999 latency with exact kernel, fio,
 and mount-option versions. Until that exists, this document makes no
 performance comparison at all.
+
+## Where LionFS sits in the design space
+
+No numbers here -- a map of design commitments. The classic split is
+in-place extent filesystems (ext4, XFS) versus copy-on-write
+checksummed pools (Btrfs, ZFS). LionFS is a third point: a journal-RoW
+metadata core with in-place data, per-block checksums, a snapshot
+tree, and its own parity engine:
+
+```mermaid
+flowchart TB
+    ROOT["filesystem design space"]
+    ROOT --> INPLACE["in-place extents - ext4 XFS"]
+    ROOT --> COW["CoW with checksums - Btrfs ZFS"]
+    INPLACE --> LION["LionFS - journal RoW metadata plus in-place data"]
+    COW --> LION
+    LION --> F1["checksum tree - per block"]
+    LION --> F2["snapshot tree - read-only CoW points"]
+    LION --> F3["RAID 0 1 5 6 10 plus RS erasure"]
+    LION --> F4["zstd clusters and per-inode AEAD"]
+    LION --> F5["stated gaps - dedup tree not wired and data CoW unused"]
+```
+
+## A countable comparison metric, and its limits
+
+The table above is verifiable by reading code, so it can be summarized
+without lying. Define the verified-feature coverage of filesystem $A$
+against reference $B$ as
+
+$$C(A, B) = \frac{|F_A^{\mathrm{wired}} \cap F_B|}{|F_B|}$$
+
+where $F^{\mathrm{wired}}$ counts only features the write path actually
+uses -- "tree exists; not wired" scores zero. Counting the six table
+rows: $C(\mathrm{LionFS}, \mathrm{ZFS}) = 5/6 \approx 0.83$, dedup
+excluded; and $4/4$ against Btrfs's native set (checksums, snapshots,
+RAID, compression). The metric counts rows in one table -- it says
+nothing about maturity, tooling, or performance, and must not be
+quoted as if it did.
+
+## What a real comparison would require (diagram)
+
+```mermaid
+flowchart LR
+    A["mount LionFS via FUSE"] --> B["fio standard profiles - 4K random and sequential"]
+    B --> C["identical NVMe kernel and fio versions"]
+    C --> D["ext4 XFS Btrfs ZFS with matched mount options"]
+    D --> E["report throughput and P99 P999 latency"]
+    E --> F["pin exact versions in the writeup"]
+```

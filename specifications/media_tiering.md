@@ -80,3 +80,44 @@ first; RMW staging steers device DMA into PMEM when present.
 `clwb_region` issues real `clwb`+`sfence` on x86-64 Linux after a raw
 CPUID probe (leaf 7, EBX bit 24), returning `false` elsewhere so the
 engine falls back to `pal::sync::sync_data` — the PAL-shaped seam.
+
+## Placement decision (diagram)
+
+```mermaid
+flowchart TD
+    OP["write op"] --> CL{"MediaClass<br/>(probed at mkfs)"}
+    CL -->|NvmeZns| Z{"plan_append: fits current zone,<br/>fill ratio below 0.85?"}
+    Z -->|yes| ZC["append to current zone<br/>(completion records placed offset)"]
+    Z -->|no| ZF["fresh zone: lowest-numbered empty,<br/>else emptiest eligible"]
+    CL -->|HddSmr| SB{"sequential append?"}
+    SB -->|yes| BD["BandAllocator: one active file per band"]
+    SB -->|no| RJ["RandomWriteRejected at open time<br/>(honest failure, never silent)"]
+    CL -->|"Nvme / Ssd / HddPmr"| AL["round_allocation, covering semantics,<br/>then split_for_submission"]
+    CL -->|CxlPmem| PT["PlacementTarget: journal, metadata leaves,<br/>bloom filters to PMEM; CLWB + fence"]
+```
+
+## WAF and the zone-switch threshold
+
+Write amplification, as the P4 exit criterion measures it (WAF < 1.1;
+`lfs_zns sim` reports 1.000 over 4000 appends on 512 zones):
+
+$$\mathrm{WAF} = \frac{\text{bytes written to media}}
+{\text{logical bytes written}} = \frac{\text{logical} + \text{padding}
++ \text{rewrite}}{\text{logical}} \approx 1 + \frac{\text{padding}}
+{\text{logical}}$$
+
+The zone switch fires when the fill ratio reaches the 85% policy point
+or the append no longer fits, whichever comes first — with write
+pointer $\mathrm{wp}$, zone start $\mathrm{zslba}$, and zone capacity
+$C_z$:
+
+$$\text{switch} \iff
+\frac{\mathrm{wp} - \mathrm{zslba}}{C_z} \ge 0.85 \ \ \text{or} \ \
+\mathrm{len} > C_z - (\mathrm{wp} - \mathrm{zslba})$$
+
+At band granularity SMR runs the same accounting with the elevator
+sweep: bands with garbage $\ge 50\%$ go read-only and are rewritten in
+idle windows, so cleaning at 50% live rewrites at most one byte per
+written byte — band-cleaning amplification is bounded by
+
+$$\mathrm{WAF}_{\text{clean}} \le \frac{1}{1 - 0.5} = 2$$

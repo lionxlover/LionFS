@@ -81,3 +81,55 @@ report and self-tests the PAL primitives:
 - **The WinFsp bridge is not yet linked**: mounting on Windows requires
   the RFC-003 §5 deliverable. The engine, mkfs, and every tool run;
   only the mount syscall path is pending.
+
+## Engine selection and PAL dispatch (diagrams)
+
+The I/O engine picks its backend at build and mount time; the PAL
+underneath dispatches per OS. Both decisions log and degrade -- rule 4
+in action, never a failed mount:
+
+```mermaid
+stateDiagram-v2
+    [*] --> EngineBuilder
+    EngineBuilder --> FastPath : ring granted
+    EngineBuilder --> ThreadedFloor : kernel refuses - logged line
+    FastPath --> ThreadedFloor : op unsupported - logged line
+    FastPath --> [*]
+    ThreadedFloor --> [*]
+```
+
+```mermaid
+flowchart LR
+    ENG["EngineBuilder"] --> TH["threaded floor - always available"]
+    ENG --> UR{"io_uring feature and ring setup"}
+    UR -->|granted| IOU["io_uring shards"]
+    UR -->|refused| TH
+    IOU --> PAL["PAL positioned IO and sync"]
+    TH --> PAL
+    PAL --> LI["Linux - pread fdatasync eventfd"]
+    PAL --> MA["macOS - pread F_FULLFSYNC self-pipe"]
+    PAL --> WI["Windows - seek_read FlushFileBuffers condvar"]
+```
+
+## Syscall amortization arithmetic
+
+The fast path's value is a count, not a claim: the threaded backend
+costs one syscall per operation, while a ring batches $N$ operations
+into one `io_uring_enter`,
+
+$$S_{\mathrm{ring}}(N) = \frac{1}{N}, \qquad S_{\mathrm{threaded}} = 1$$
+
+so per-op submission cost falls as $1/N$. The measured shape on this
+host (`lfs_engine`, README and `specifications/io_engine.md`): 707
+MiB/s 4 KiB writes and 1627 MiB/s reads on the ring, versus 115 and
+117 on the threaded floor -- a write ratio of
+
+$$\frac{X_{\mathrm{ring}}}{X_{\mathrm{threaded}}} = \frac{707}{115} \approx 6.1$$
+
+The threaded floor remains the CI workhorse precisely because it runs
+everywhere the ring cannot -- macOS, Windows, and CI kernels without
+io_uring -- which is the point of the degradation ladder above. The
+porting rules are countable the same way: the `#[cfg(target_os)]`
+surface allowed outside `src/pal/` is one site (the `#[cfg(unix)]`
+FUSE bridge at the `vfs` boundary), a budget of $b_{\mathrm{cfg}} = 1$
+enforced by review -- a second site is a porting bug by rule 1.

@@ -50,3 +50,31 @@ f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8.
 
 KMS clients, TPM sealing, recovery-key escrow — all attach at the
 envelope layer.
+
+## Key hierarchy (diagram)
+
+```mermaid
+flowchart TD
+    P["user passphrase"] -->|"PBKDF2-HMAC-SHA256<br/>(600k iterations, 128-bit salt)"| KEK["KEK, 32 B"]
+    KEK -->|"ChaCha20-Poly1305 wrap<br/>(nonce 12 B, tag 16 B)"| BLOB["on-disk wrapped blob"]
+    BLOB -->|"unwrap: AEAD tag failure is audible"| M["volume master, random 32 B"]
+    M -->|"HMAC-SHA256,<br/>domain tag LFS3/file-key/v1 or file_id"| FK["per-file keys"]
+```
+
+## Online-guess economics
+
+Every wrong passphrase pays the full KDF before the AEAD tag can reject
+it. With $\mu = 600{,}000$ iterations at $t_{\text{SHA256}}$
+HMAC-SHA256 compressions per second, one guess costs $\mu/t$ and the
+mount-time budget of three attempts costs
+
+$$\frac{3\mu}{t_{\text{SHA256}}} \approx
+\frac{1.8 \times 10^{6}}{10^{7}/\mathrm{s}} \approx 0.18\ \mathrm{s}$$
+
+after which the mount gate locks out ([wiring.md](wiring.md) key flow;
+the audit trail records create, reject, unlock, lockout, rotation).
+The off-line attacker needs the wrapped blob itself — it never leaves
+the volume — and pays $\mu$ per guess per core:
+
+$$\lambda_{\text{guess}} = \frac{t_{\text{SHA256}}}{\mu} \approx
+16.7\ \mathrm{guesses/s\ per\ core}$$

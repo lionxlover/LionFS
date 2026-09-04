@@ -2,6 +2,23 @@
 
 LionFS 2.0 builds from one code base on Linux, macOS, and Windows.
 
+## Toolchain decision at a glance
+
+```mermaid
+flowchart TB
+    START["cargo build --release"] --> OS{"Host OS"}
+    OS -->|"Linux"| LF{"Want the io_uring fast path?"}
+    OS -->|"macOS"| MAC["Portable build (threaded backend, macFUSE only for mounting)"]
+    OS -->|"Windows"| WIN["Portable build (MSVC, zero external crates)"]
+    LF -->|"yes"| FAST["cargo build --features io_uring (graceful fallback if the kernel refuses the ring)"]
+    LF -->|"no"| PORT["Portable build (threaded backend)"]
+    FAST --> TEST["cargo test (713 tests as of 3.1)"]
+    PORT --> TEST
+    MAC --> TEST
+    WIN --> TEST
+    TEST --> GATE["Gates: clippy -D warnings, cargo fmt"]
+```
+
 ## Prerequisites
 
 - **Rust** 1.75+ (`rustup` recommended). The toolchain is pinned as a
@@ -31,6 +48,23 @@ cargo bench                                 # criterion benches
 | Feature | Default | Effect |
 |---|---|---|
 | `io_uring` | off | Compiles the Linux io_uring engine backend. Without it (or on non-Linux, or where the kernel refuses the ring) the engine uses the threaded backend — correct, slower, logged. |
+
+### Build-matrix arithmetic
+
+Three operating systems times two feature states gives the nominal
+configuration matrix
+
+$$|\mathcal{M}| = 3 \times 2 = 6$$
+
+but `io_uring` only engages on Linux, so the effective matrix is
+$2 + 1 + 1 = 4$ configurations — and every one of them has to keep
+the suite green. The extra Linux cell buys the fast path; measured
+with `lfs_engine` (the README carries the same numbers):
+
+$$S_{\mathrm{write}} = \frac{707}{115} \approx 6.1\times, \qquad S_{\mathrm{read}} = \frac{1627}{117} \approx 13.9\times$$
+
+for 4 KiB writes and reads respectively, io_uring versus the threaded
+backend on the same host.
 
 ## Targets of interest
 

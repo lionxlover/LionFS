@@ -7,12 +7,61 @@ cross-platform operation** (Linux, macOS, Windows) from one code base.
 This README describes what the tree actually implements; it
 deliberately does not advertise features that aren't there.
 
-**Status: 3.0 pre-alpha, unverified on real hardware.** The engine
-compiles and its test suite is green on Linux (with and without
-io_uring); macOS/Windows are compile-clean by construction (the PAL
-carries all platform differences) and exercised in CI. Before trusting
-it with data: build it, run `cargo test`, exercise it against real
-workloads.
+**Status: 3.1 pre-alpha, unverified on real hardware.** The engine
+compiles and its test suite (**713 tests**) is green on Linux (with
+and without io_uring); macOS/Windows are compile-clean by
+construction (the PAL carries all platform differences) and exercised
+in CI. Before trusting it with data: build it, run `cargo test`,
+exercise it against real workloads -- then run
+`lfs_simulate sweep` and watch every crash point pass.
+
+## Architecture at a glance
+
+One request path, layered top to bottom; every platform difference is
+confined to the PAL, and every 3.0 policy layer sits on the path it
+governs through a `src/wiring/` seam:
+
+```mermaid
+flowchart TB
+    APP["Applications"] --> FUSE["FUSE bridge (Linux, macFUSE)"]
+    APP --> WINFSP["WinFsp bridge (Windows, RFC-003 binding design)"]
+    FUSE --> VFS["vfs: the VfsOps surface"]
+    WINFSP --> VFS
+    VFS --> WIRE["wiring: 7 seams (qos_gate, small_write, gc_loop, retention_daemon, telemetry_bridge, key_flow, tar_stream)"]
+    WIRE --> ENGINE["io_engine: per-core shards, MPMC queues, group commit"]
+    ENGINE --> INDEX["B-epsilon extent index, HAMT namespace"]
+    ENGINE --> PAL["PAL: positioned I/O, sync flavors, geometry, CSPRNG, wakers"]
+    PAL --> URING["io_uring backend (Linux, feature-gated)"]
+    PAL --> THREADED["Threaded backend (portable floor)"]
+    URING --> MEDIA["Media tiers: SSD, ZNS, SMR, CXL-PMEM"]
+    THREADED --> MEDIA
+    GUARDIAN["Guardian advisory bus (strictly out-of-band)"] -.-> WIRE
+    SIM["sim: deterministic crash simulator"] -.-> WIRE
+```
+
+How one write traverses the 3.1 wiring, end to end:
+
+```mermaid
+flowchart LR
+    REQ["VFS write"] --> QUOTA["Quota early-reject"]
+    QUOTA --> BUCKETS["Dual token buckets (bytes/s + ops/s)"]
+    BUCKETS --> ROUTE{"Write size 4032 B or less?"}
+    ROUTE -->|yes| JOURNAL["Record journal: one sequential log write"]
+    ROUTE -->|no| COW["Ordinary CoW data path"]
+    JOURNAL --> OVERLAY["Read-your-write overlay"]
+    OVERLAY --> DRAIN["Checkpoint drain into the B-epsilon tree"]
+    DRAIN --> COMMIT["Group commit batch, WFQ pick (weights 8:4:1)"]
+    COW --> COMMIT
+    COMMIT --> BARRIER["PAL durability barrier"]
+    BARRIER --> CUT{"sim: power cut at op index?"}
+    CUT -->|no crash| DONE["Write durable"]
+    CUT -->|crash| REPLAY["Replay: prefix property, overlay convergence"]
+```
+
+The GC loop runs the same CoW path as a Bulk-class background
+circuit; the retention and rebalance daemons tick on caller-supplied
+time; the telemetry bridge exports 19 bounded series built from every
+layer's A/B counters.
 
 ## The 2.0 architecture (LFS-RFC-002, implemented here)
 
@@ -37,17 +86,64 @@ unchanged 2.0 substrate** (none of them moved a floor joist):
 | **Capacity plane** | 256-bit `WideAddr` (opt-in, mkfs-time; domain/namespace/volume/region/device/LBA + in-address byte offset for PMEM/CXL tiers), lossless 128↔256 embedding, superblock `plane` gate | `src/addressing/va256.rs` |
 | **QoS & multi-tenancy** | 24 IO priority slots (Realtime/BestEffort/Bulk × 8), dual token buckets (bytes/s + ops/s, burst, lazy integer refill), per-namespace quotas with grace windows, WFQ in virtual time (declared-cost, anti-laundering) | `src/qos/` |
 | **Small-file record journal** | ≤4032 B writes: 3 scattered device ops → 1 sequential log write (40 B header + payload + CRC32), torn-tail replay, `Commit`/`Checkpoint` watermark protocol | `src/recordlog/` |
-| **Copy-GC** | Rosenblum-Ousterhout cost/benefit + wear leveling + panic-mode watermarks (20%/8%), bounded plans, honest all-live refusal | `src/gc/` |
+| **Copy-GC** | Rosenblum-Ousterhout cost/benefit + wear leveling + panic-mode watermarks (tuned 25%/10% in 3.1), bounded plans, honest all-live refusal | `src/gc/` |
 | **Guardian (autonomous ops)** | Ransomware entropy watch (Shannon + rewrite + lure EWMAs), Weibull drive-failure predictor with telemetry multipliers, 6-class workload classifier, advisory bus with escalation-safe rate limiting — **all userspace, out-of-band** | `src/guardian/` |
 | **Observability** | Dependency-free Prometheus text exposition: 49-bucket log-linear latency histograms, counters/gauges, deterministic scrapes | `src/telemetry/prometheus.rs` |
 | **Migration on-ramp** | 10-rule magic-byte detection (ext4/XFS/Btrfs/ZFS/F2FS/NTFS/FAT32/exFAT/HFS+/APFS), SHA-256 manifest verification protocol, strategy planner (tar-stream / per-file / raw-block-with-sign-off) | `src/migrate/` |
 | **Container/VM awareness** | Image-layer CAS with refcounted sharing + hot-index pinning; virtiofs passthrough policy table (cache model / DAX / squash) | `src/container/` |
 | **Key management** | PBKDF2-HMAC-SHA256 (600k iters) → KEK wraps the volume master (ChaCha20-Poly1305); per-file keys = HMAC-PRF (re-key is metadata-only); volatile-zeroizing envelope | `src/security/kdf.rs` |
-| **Snapshot retention** | GFS tier budgets (24h/14d/8w/12m/3y defaults), additive representative selection, integer civil/ISO-week calendar | `src/fs/retention.rs` |
+| **Snapshot retention** | GFS tier budgets (tuned 48h/14d/8w/12m/7y in 3.1), additive representative selection, integer civil/ISO-week calendar | `src/fs/retention.rs` |
 | **Pool evolution** | Online rebalance: capacity-proportional targets, health-discounted evacuation (Guardian-integrated), drain-to-remove, budget-sized moves on the CoW path | `src/pool/rebalance.rs` |
 
 The complete normative architecture is
 [`docs/rfc/LFS-RFC-004-unlimited.md`](docs/rfc/LFS-RFC-004-unlimited.md).
+
+## The 3.1 wiring (Phase 8): policy layers onto the live paths
+
+3.0's subsystems were consultative. 3.1 puts each on the path it
+governs, behind a narrow seam (`src/wiring/`) whose contract is
+uniform: the engine owns the thread, the wiring owns the step, every
+decision is a pure function of caller-supplied time, and every
+switch carries A/B counters (RFC-002 §2.4 applies to the wiring
+itself).
+
+| Wiring point | What it does | Where |
+|---|---|---|
+| **QoS admission + WFQ batch pick** | Quota early-reject → token buckets at the shard gate (Realtime's guarantee = metered overrun, never delay); group commit picks batches by WFQ virtual finish (weights 8:4:1) | `wiring::qos_gate` |
+| **Small-write switch** | ≤4032 B writes route to the record journal (one sequential write instead of three scattered ops), read-your-write overlay, checkpoint drain into the B-epsilon tree | `wiring::small_write` |
+| **GC execution loop** | census → cost/benefit plan → evacuate via the ordinary CoW path → reclaim accounting; Bulk class always, rate-unlimited in panic mode | `wiring::gc_loop` |
+| **Retention + rebalance daemons** | GFS retention passes (interval-rate-limited, failed expirations retried); rebalance rounds to `is_balanced`, leaving devices drain first | `wiring::retention_daemon` |
+| **Telemetry bridge** | Guardian advisory bus + every wiring layer's counters → 19 bounded Prometheus series; the telemetry and health sockets scrape one object | `wiring::telemetry_bridge` |
+| **Key envelope flow** | mkfs create / mount unlock with 3-attempt lockout / passphrase rotation (master untouched) | `wiring::key_flow` |
+| **Tar import session** | Real ustar stream (checksum-verified, GNU longname) → POSIX write path → SHA-256 read-back verification | `wiring::tar_stream` |
+| **Deterministic crash simulator** | Seeded universes on a simulated clock; power cuts at deterministic op indexes; replay invariants (prefix property, overlay convergence) as assertions; exhaustive crash-point sweeps | `sim` + `lfs_simulate` |
+
+Tuned defaults (the ③ pass): GC watermarks **25% kick / 10%
+aggressive**, retention **48 hourly / 7 yearly**, QoS per-class rates
+(RT 16 GiB/s, BE 4 GiB/s, bulk 1 GiB/s) with WFQ weights **8:4:1**.
+
+### Capacity and service arithmetic
+
+The default 128-bit plane addresses
+
+$$V_{128} = 2^{128} - 1 \approx 3.4 \times 10^{38}\ \mathrm{bytes}$$
+
+per volume, and the opt-in 256-bit `WideAddr` plane squares that to
+$2^{256} \approx 1.2 \times 10^{77}$ addresses. For scale: at the
+tuned Realtime ceiling of 16 GiB/s, exhausting the 128-bit LBA space
+would take
+
+$$T = \frac{2^{128}}{16 \cdot 2^{30}\ \mathrm{B/s}} \approx 6 \times 10^{20}\ \mathrm{years} \approx 4 \times 10^{10}\ \mathrm{ages\ of\ the\ universe}$$
+
+— the plane is never the bottleneck, the channel is. Under saturation
+the WFQ weights 8:4:1 entitle each class to a service share
+
+$$\rho_i = \frac{w_i}{\sum_j w_j}, \qquad (\rho_{\mathrm{RT}},\ \rho_{\mathrm{BE}},\ \rho_{\mathrm{bulk}}) \approx (61.5\%,\ 30.8\%,\ 7.7\%)$$
+
+and the inline small-file threshold is pure inode geometry —
+$4096 - 64 = 4032$ bytes, a 4 KiB block minus the 64-byte inode v3
+core — which is why a small file costs one metadata read and zero
+data blocks.
 
 **Cross-platform (LFS-RFC-003):** the platform abstraction layer
 (`src/pal/`) is the only place Linux/macOS/Windows differ — positioned

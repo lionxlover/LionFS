@@ -29,6 +29,18 @@ the rewrite/lure signals: entropy alone caps the score at 5000, so a
 compression workload (new files, no lures) never freezes, while a
 full-volume encrypt-in-place reaches the line in ~6 windows.
 
+The score is an EWMA over per-window evidence, integer 32.32
+fixed-point throughout:
+
+$$S_t = \alpha\, x_t + (1 - \alpha)\, S_{t-1}, \qquad \alpha = 0.25$$
+
+Evidence half-life: $\ln 2 / \ln(4/3) \approx 2.4$ windows. The
+per-window evidence is the weighted table, $x_t = 10^{4}\,(0.5\,e_H + 0.3\,e_R + 0.2\,e_L)$ bps with $e_H$ saturated at
+$H = 7.5$ bits/byte — so entropy alone caps $x$ at 5000 bps, and
+convergence from zero is geometric:
+
+$$S_k = x\,(1 - 0.75^{k}) \;\Rightarrow\; k \approx 5.6\ \text{windows to reach 8000 from}\ x = 10^{4}$$
+
 ### 7.2 Drive-failure prediction
 
 Two deliberately separate signals:
@@ -46,6 +58,15 @@ Two deliberately separate signals:
 Output: band, multiplier, annualized effective hazard, estimated
 median remaining hours — "migrate within days" for Failing, weeks
 for Degraded.
+
+The baseline in notation (per-hour hazard; the spec's form above is
+the annualized $8760\,h(t)$):
+
+$$h(t) = \frac{k}{\eta} \left(\frac{t}{\eta}\right)^{k-1}, \qquad k = 1.30, \quad \eta = 8 \times 10^{4}\ \mathrm{h}$$
+
+feeding the saturated median remaining-life estimate:
+
+$$t_{\text{med}} = \frac{\ln 2}{h_{\mathrm{yr,eff}}}, \qquad t_{\text{med}} \le 100\ \text{years}$$
 
 ### 7.3 Workload classifier
 
@@ -75,6 +96,25 @@ LogOnly so operators see the ramp.
 Advisories: `RansomwareSuspicion / DriveRisk{band} /
 WorkloadShift{class}` × `FreezeSnapshots / EscalateScrub /
 PlanMigration / RetunePolicies / LogOnly`.
+
+The advisory bus, end to end:
+
+```mermaid
+flowchart TB
+    subgraph DET["detectors (pure functions of evidence)"]
+        EN["7.1 entropy watch<br/>EWMA, 32.32 fixed-point"]
+        DR["7.2 drive prediction<br/>telemetry multiplier + Weibull prior"]
+        WC["7.3 workload classifier<br/>EWMA moments, first-match cascade"]
+    end
+    DET --> TK["Agent::tick per window<br/>(observe_suspicion / observe_drive / observe_workload)"]
+    TK --> BUS["advisory bus: bounded ring (256),<br/>rate-limited per (kind, band-or-class, device),<br/>escalations never suppressed"]
+    BUS --> ADV["advisories: RansomwareSuspicion,<br/>DriveRisk, WorkloadShift"]
+    ADV --> ACT["policy actions, control plane only:<br/>FreezeSnapshots / EscalateScrub /<br/>PlanMigration / RetunePolicies / LogOnly"]
+    BUS --> SOCK["telemetry socket: advisory stream<br/>+ evidence gauges"]
+    ACT --> LOG["logged with evidence -<br/>no model in the data path"]
+```
+
+The socket side is the telemetry bridge in [`wiring.md`](wiring.md).
 
 ## Kept fixed
 

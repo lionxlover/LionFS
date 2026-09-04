@@ -117,3 +117,79 @@ The tradeoff is real: +0.12x ratio from level 3 to 9 costs 6.8x the CPU. Level 3
 ## Cross-filesystem comparison
 
 **There is none, and none is claimed.** No ext4/XFS/Btrfs/ZFS was built, mounted, or run on this hardware as part of this work. `docs/comparison.md` previously contained a fabricated IOPS table attributed to hardware that never ran this code; it has been removed. A credible comparison requires LionFS mounted normally, fio, real NVMe, and the comparison filesystems configured identically -- same hardware, same run.
+
+## The harness path (diagram)
+
+What `lfs_ioperf` actually exercises, per op, in order:
+
+```mermaid
+flowchart TB
+    W["workload generator - pattern rate and depth"] --> FM["FileManager reads and writes"]
+    FM --> ALLOC["bitmap allocator - frontier cursor"]
+    FM --> CS["checksum tree - XxHash64 per block"]
+    FM --> TX["transaction layer - journal then commit"]
+    TX --> RAID["RAID engine - P and Q parity"]
+    RAID --> IMG["image files on tmpfs"]
+    ALLOC --> M["medians of interleaved A B rounds"]
+    CS --> M
+    TX --> M
+```
+
+The parity A/B the RAID section measures, as a graph:
+
+```mermaid
+flowchart TB
+    PW["write to a RAID member"] --> CHK{"partial chunk?"}
+    CHK -->|no| FS["full stripe write - parity computed inline"]
+    CHK -->|yes| MODE{"parity mode"}
+    MODE -->|LFS_PARITY_FULL=1| FULL["recompute - read the other k-1 data blocks"]
+    MODE -->|default since P3| INC["incremental RMW - read old data and old parity"]
+    FULL --> NEWP["new P and Q"]
+    INC --> NEWP
+```
+
+## Queueing arithmetic for these numbers
+
+The harness is a closed CPU-cost model, not a device queueing system.
+These identities are what a mounted benchmark would have to satisfy,
+and what this harness cannot measure:
+
+An open system with per-op CPU cost $s$ and per-batch overhead $p$,
+batching $N$ ops per submission, has a throughput ceiling
+
+$$X \le \frac{N}{Ns + p} = \frac{1}{s + p/N}$$
+
+That is the io_uring amortization shape: one `io_uring_enter` per
+batch of $N$ ops over registered buffers. As $N \to \infty$, $X \to 1/s$
+-- the bound collapses to pure per-op CPU cost, which is what the
+tmpfs numbers above measure. Little's law,
+
+$$N_{\mathrm{inflight}} = X \cdot R$$
+
+ties outstanding requests to throughput and response time; neither
+$N_{\mathrm{inflight}}$ nor $R$ is observable here, which is why no
+latency appears anywhere above.
+
+The parity-read arithmetic behind the P2 and P3 tables, exactly as
+measured: a full parity recompute for a single-block write reads the
+other $k-1$ data blocks of the stripe row; incremental RMW reads only
+old data and old parity:
+
+$$R_{\mathrm{full}} = k - 1, \qquad R_{\mathrm{inc}} = 2$$
+
+For 4-dev RAID5 ($k = 3$) that is the measured 2.00 row reads/write;
+for 6-dev RAID6 ($k = 4$) the measured 3.00; post-P3 the measured
+0.00 row reads (the two RMW reads are block reads, not stripe-row
+reads).
+
+The fragments column is arithmetic too: mean extent length for a file
+of size $S$ with $F$ fragments is $\bar{e} = S/F$. The 32 MiB
+sequential file at $F = 8192$ has $\bar{e} = 4\ \mathrm{KiB}$ -- one
+block per extent; at $F = 8$ it has $\bar{e} = 4\ \mathrm{MiB}$, a
+$1024\times$ longer physical run per extent probe, which is where the
+read improvement lives.
+
+The compression ratio, measured from the allocator bitmap rather than
+inferred:
+
+$$r = \frac{B_{\mathrm{logical}}}{B_{\mathrm{physical}}} = \frac{2048}{706} \approx 2.90$$

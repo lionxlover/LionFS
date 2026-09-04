@@ -70,3 +70,58 @@ the checksum-tree insert is ~45% of write cost (per a
 dominates RAID6 commit cost; the journal writes every dirty block
 twice (journal + final location) by design for crash safety. These
 are the honest starting points for future work.
+
+## Hot-path flow (diagram)
+
+The measured components in one graph -- every box is a claim from the
+sections above, traceable to a commit:
+
+```mermaid
+flowchart TB
+    W["pwrite call"] --> ZC["stack buffer - no heap Vec copy"]
+    ZC --> SPEC["speculative run allocation - blocks plus 25 percent"]
+    SPEC --> META["metadata zoning - checksum nodes at group end"]
+    SPEC --> J["journal write - every dirty block by design"]
+    J --> CS["checksum tree insert - XxHash64 per block"]
+    CS --> PAR["RAID parity - incremental RMW delta"]
+    PAR --> GCB["group commit batch - shared device flush"]
+    GCB --> CK["checkpoint - root swap and superblock"]
+```
+
+## The cost model behind the numbers
+
+Per-block write cost decomposes as
+
+$$C_{\mathrm{write}} = C_{\mathrm{base}} + C_{\mathrm{csum}} + C_{\mathrm{parity}} + C_{\mathrm{journal}}$$
+
+with the measured checksum share $C_{\mathrm{csum}} \approx 0.45\,C_{\mathrm{write}}$
+(the `--no-checksums` A/B). The journal's cost is device bytes, not
+CPU: every dirty block is written twice by design, a write
+amplification of
+
+$$A = \frac{W_{\mathrm{device}}}{W_{\mathrm{logical}}} = 2$$
+
+before parity (RAID5 adds one parity block per $k$ data blocks) and
+before compression (which divides physical bytes by the measured
+ratio). The checksum share also bounds the payoff of any checksum
+optimization: removing it entirely buys at most
+$1/(1-0.45) \approx 1.8\times$, which is why the insert -- not the
+copy paths P1.1 already fixed -- tops the remaining-cost list.
+
+Queueing identities for the mounted system, stated as constraints
+because they are not measured here: throughput is bounded by per-op
+CPU cost $s$ and per-batch overhead $p$,
+
+$$X \le \frac{1}{s + p}, \qquad X_N \le \frac{N}{Ns + p} = \frac{1}{s + p/N}$$
+
+with $N$ the batch size, and Little's law ties queue depth to latency:
+
+$$N_{\mathrm{inflight}} = X \cdot R$$
+
+The amortization shape is visible in the one measured engine-level
+figure: `lfs_engine` reports 707 MiB/s on 4 KiB writes with io_uring
+(batched `io_uring_enter`, registered buffers) against a 115 MiB/s
+threaded floor on the same host -- README and
+`specifications/io_engine.md`; the shared 2-vCPU container bounds the
+absolute values, the $\approx 6.1\times$ ratio is the $p/N$
+signature.

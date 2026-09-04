@@ -66,3 +66,36 @@ bounded racy `len`.
 - No sharding of the transaction manager (journal appends serialize
   by design; group commit batches across shards through the shared
   engine flush).
+
+## Grace period (diagram)
+
+```mermaid
+sequenceDiagram
+    participant R as reader
+    participant E as global epoch
+    participant P as publisher
+    R->>E: pin guard (atomic load)
+    E-->>R: borrow generation, clone the Arc
+    Note over R,E: no lock held, read may run arbitrarily long
+    P->>E: publish, swap in the new Arc
+    P->>E: defer_destroy on the retired cell
+    E->>E: advance once pre-existing guards drain
+    E-->>P: grace period elapsed
+    P->>P: retired generation freed<br/>(only now may the memory be reused)
+    R->>E: drop guard
+```
+
+## Reclamation delay bound
+
+A retired generation waits for every guard pinned before the publish:
+
+$$D_{\text{reclaim}} \le \max_{i \in \text{cores}} R_i$$
+
+where $R_i$ is the longest read-side critical section outstanding at
+publish time. Epochs are global — no per-read thread registration — so
+the max runs over all cores: the same trade kernel RCU makes on large
+machines, buying a per-read cost of one atomic load plus one refcount
+increment and never a spin. On the writer side the seqlock makes torn
+reads impossible to accept (4 readers across 10k writes) and lost
+updates structurally absent (8 writers, 16k increments, exactly 16k
+accounted).

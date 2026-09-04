@@ -24,12 +24,17 @@
 //!   forever is how you pin its write endurance).
 //! * **score** = `benefit / cost`, picked highest-first.
 //!
-//! Watermarks: the planner produces nothing while free-space is above
-//! `kick` (default 20%); produces a background trickle between `kick`
-//! and `aggressive` (default 8%); above `aggressive`, selection
-//! switches to *panic mode* -- score ordering degrades to pure
-//! freeable-bytes ordering, because at 8% free the correct move is to
-//! reclaim *now*, not to be clever.
+//! Watermarks (tuned in 3.1, the ③ tuning pass): the planner
+//! produces nothing while free-space is above `kick` (default 25%);
+//! produces a background trickle between `kick` and `aggressive`
+//! (default 10%); below `aggressive`, selection switches to *panic
+//! mode* -- score ordering degrades to pure freeable-bytes
+//! ordering, because at 10% free the correct move is to reclaim
+//! *now*, not to be clever. The 3.0.0 defaults (20/8) left a 12-point
+//! background band; the tuned 25/10 leaves 15 points -- 25% more
+//! room for the cost/benefit selector to work before panic, which
+//! is what keeps panic mode a rare event rather than a nightly one
+//! (the fill-rate math is in `wiring::gc_loop`'s module docs).
 //!
 //! This module is the policy/planning layer: it emits relocation plans
 //! (which segments, which live extents in them, estimated copy and
@@ -42,10 +47,14 @@
 
 use std::time::Duration;
 
-/// Default free-space fraction at which background GC kicks in.
-pub const DEFAULT_KICK_PCT: u8 = 20;
-/// Default free-space fraction at which GC becomes aggressive.
-pub const DEFAULT_AGGRESSIVE_PCT: u8 = 8;
+/// Default free-space fraction at which background GC kicks in
+/// (tuned 3.1: was 20; 25 starts the trickle earlier so the
+/// background band drains before workload peaks do).
+pub const DEFAULT_KICK_PCT: u8 = 25;
+/// Default free-space fraction at which GC becomes aggressive
+/// (tuned 3.1: was 8; 10 leaves a 10-point panic runway, and the
+/// wider background band keeps panic rare).
+pub const DEFAULT_AGGRESSIVE_PCT: u8 = 10;
 
 /// One reclaimable unit: a zone (ZNS), band (SMR), or region slice
 /// (conventional). All fields are caller-supplied; the planner is
@@ -104,10 +113,18 @@ impl Default for GcConfig {
         Self {
             kick_pct: DEFAULT_KICK_PCT,
             aggressive_pct: DEFAULT_AGGRESSIVE_PCT,
-            wear_bps_per_100_cycles: 5,
-            // One week half-life: snapshots/CoW churn is daily-ish.
-            age_half_life_ns: Duration::from_secs(7 * 24 * 3600).as_nanos() as u64,
-            max_segments_per_plan: 8,
+            // Tuned 3.1: was 5. Flash wear-out accelerates
+            // superlinearly with program cycles; a steeper penalty
+            // steers selection away from hot segments sooner.
+            wear_bps_per_100_cycles: 8,
+            // Tuned 3.1: was 7 days. Snapshot/CoW churn is daily-ish,
+            // so a 5-day half-life separates cold from hot a full
+            // day sooner.
+            age_half_life_ns: Duration::from_secs(5 * 24 * 3600).as_nanos() as u64,
+            // Tuned 3.1: was 8. Background rounds are Bulk-class and
+            // rate-limited (wiring::gc_loop); a deeper batch
+            // amortizes the planner census over more reclamation.
+            max_segments_per_plan: 12,
         }
     }
 }
@@ -293,7 +310,7 @@ mod tests {
 
     #[test]
     fn background_mode_between_watermarks() {
-        let p = GcPlanner::default(); // kick 20%, aggressive 8%
+        let p = GcPlanner::default(); // kick 25%, aggressive 10% (tuned)
         let stats = vec![seg(1, SEG / 2, DAY, 0)];
         let plan = p.plan(&stats, 100 * SEG, 15 * SEG).expect("15% free -> background");
         assert_eq!(plan.urgency, GcUrgency::Background);
@@ -314,6 +331,32 @@ mod tests {
             .expect("5% free -> aggressive");
         assert_eq!(plan.urgency, GcUrgency::Aggressive);
         assert_eq!(plan.segments.first().copied(), Some(1)); // most freeable first
+    }
+
+    #[test]
+    fn tuned_watermarks_widen_the_background_band() {
+        // The 3.1 tuning: kick 25, aggressive 10 (was 20/8). The
+        // background band is 15 points wide, and these boundaries:
+        let p = GcPlanner::default();
+        let stats = vec![seg(1, SEG / 2, DAY, 0)];
+        // 9% free: strictly below aggressive -> Aggressive.
+        assert_eq!(
+            p.plan(&stats, 100 * SEG, 9 * SEG).unwrap().urgency,
+            GcUrgency::Aggressive
+        );
+        // 10% free: AT the aggressive boundary -> Background
+        // (aggressive is strict <).
+        assert_eq!(
+            p.plan(&stats, 100 * SEG, 10 * SEG).unwrap().urgency,
+            GcUrgency::Background
+        );
+        // 25% free: at the kick boundary -> healthy.
+        assert!(p.plan(&stats, 100 * SEG, 25 * SEG).is_none());
+        // 24% free: just below kick -> Background.
+        assert_eq!(
+            p.plan(&stats, 100 * SEG, 24 * SEG).unwrap().urgency,
+            GcUrgency::Background
+        );
     }
 
     #[test]
@@ -353,7 +396,8 @@ mod tests {
         cfg.max_segments_per_plan = 3;
         let p = GcPlanner::new(cfg);
         let stats: Vec<SegmentStat> = (0..10).map(|i| seg(i, SEG / 4, DAY, 0)).collect();
-        let plan = p.plan(&stats, 100 * SEG, 10 * SEG).expect("10% free -> aggressive");
+        // 9% free: below the tuned aggressive watermark (10%).
+        let plan = p.plan(&stats, 100 * SEG, 9 * SEG).expect("9% free -> aggressive");
         assert_eq!(plan.segments.len(), 3);
         // Deterministic tiebreak: equal scores order by segment id.
         assert_eq!(plan.segments, vec![0, 1, 2]);

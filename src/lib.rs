@@ -115,3 +115,23 @@ pub mod container;
 /// Prometheus text-exposition metrics registry with log-linear
 /// latency histograms (RFC-004 §8).
 pub use telemetry::prometheus;
+
+// --- LionFS 3.1 (Phase 8: the wiring) ---------------------------------------
+
+/// The Phase 8 wiring (RFC-004 §15): every 3.0 policy layer onto the
+/// live engine path it governs -- QoS admission into the shard
+/// dispatcher, WFQ into group commit's batch pick, the record
+/// journal onto the small-write path, the GC planner's execution
+/// loop, retention into the snapshot daemon, rebalance into the
+/// pool manager, Guardian + Prometheus onto the sockets, key
+/// envelopes into mkfs/mount, and migration onto the real ustar
+/// stream. Every seam is a pure step function over caller-supplied
+/// time.
+pub mod wiring;
+
+/// The deterministic simulator (Phase 8, ②): seeded universes, a
+/// simulated clock, and the full-stack crash simulator that injects
+/// power cuts at deterministic points and verifies replay
+/// convergence as an invariant. Same seed, same universe,
+/// bit-for-bit, on every platform.
+pub mod sim;

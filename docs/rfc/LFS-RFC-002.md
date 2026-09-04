@@ -7,7 +7,11 @@
 | Author | LionFS Architecture Review Board |
 | Date | September 2026 |
 
-> This is the in-repository Markdown source of the LionFS 2.0 architecture RFC. The normative PDF is `lionfs-2.0-architecture-rfc.pdf`. Section numbering matches the PDF.
+> This is the in-repository Markdown source of the LionFS 2.0
+> architecture RFC. As of 3.1, Markdown **is** the normative format:
+> the PDF rendering was retired (single-source-of-truth discipline;
+> Mermaid diagrams and LaTeX math render natively on GitHub and in
+> any Pandoc-capable viewer). Section numbering is unchanged.
 
 *The target architecture for a line-rate, media-aware, self-healing universal file system — grounded in the measured LionFS 1.x baseline, where every performance claim is reproducible.*
 
@@ -67,6 +71,23 @@ The 2.0 architecture is organized around five pillars, each answering a failure 
 - **5** architecture pillars
 - **3** required deliverables
 - **7** roadmap phases (P0-P6)
+
+The pillar-to-deliverable structure of the 2.0 target:
+
+```mermaid
+flowchart TB
+    BASE["LionFS 1.x substrate<br/>extent-based FUSE fs, RAID 0/1/5/6/10 pools,<br/>GF(256) parity, compression clusters,<br/>checksum tree, transaction journal"]
+    subgraph TWO["LionFS 2.0 target architecture"]
+        P1["Pillar I — I/O engine and concurrency<br/>io_uring front door, SPDK/DPDK bypass plane,<br/>per-core lock-free shards, RCU path lookup"]
+        P2["Pillar II — addressing and namespace<br/>128-bit volume addresses, 16 B packed extents,<br/>inline small files, B-epsilon extent index, HAMT"]
+        P3["Pillar III — reliability and recovery<br/>redirect-on-write plus intent journal,<br/>dual-speed checksums, autonomous repair"]
+        P4["Pillar IV — hardware-aware tiering<br/>ZNS zone-append, SMR band-sequential writes,<br/>probed alignment, CXL PMEM tier"]
+        P5["Pillar V — compression and deduplication<br/>tiered LZ4/zstd/QAT, per-cluster BLAKE3,<br/>inline dedup with content-defined chunking"]
+    end
+    BASE --> TWO
+    TWO --> DELIV["Deliverables A, B, C (Sections 8, 9, 10)"]
+    DELIV --> RM["Roadmap P0-P6, measured exit criteria (Section 11)"]
+```
 
 Three deliverables are required by the review board and provided in full: a core architecture blueprint with field-level on-disk structure tables (Section 8), a read/write lifecycle walkthrough that traces operations from user space down to NAND and magnetic media (Section 9), and a trade-off analysis that confronts the classical operating-system tensions — copy-on-write fragmentation versus in-place write speed, metadata memory footprint versus lookup latency, compression ratio versus CPU — and states the mechanism, the cost, and the residual risk of every resolution (Section 10). Section 11 maps the whole target onto the existing codebase as a seven-phase roadmap with exit criteria, each phase benchmarked under the same interleaved A/B protocol the 1.x work used.
 
@@ -153,6 +174,16 @@ The design target is a dual-socket x86-64 or ARM server with one or more PCIe 5.
 
 *Table 4: Per-operation CPU budget at line rate (16-core host, Gen5 x4 device)*
 
+The budget is arithmetic before it is software:
+
+$$t_{\mathrm{op}}^{\mathrm{per\ core}} = \frac{N_{\mathrm{cores}}}{\mathrm{IOPS}_{\mathrm{device}}} = \frac{16}{2 \times 10^{6}\ \mathrm{s^{-1}}} = 8\ \mu\mathrm{s}$$
+
+— the full per-core budget before the engine share of Table 4 is subtracted. Engine speedups then compose under Amdahl's law: with $p$ the parallelizable fraction of per-operation work and $N$ cores,
+
+$$S(N) = \frac{1}{(1 - p) + \frac{p}{N}}, \qquad S(\infty) = \frac{1}{1 - p}$$
+
+so the residual serial fraction $(1 - p)$ — a global lock, a shared cacheline, a syscall — caps every phase's speedup; that is the arithmetic behind the zero global-lock budget above and the phase exit criteria of Section 11.
+
 ### 2.2 Workload matrix and success metrics
 
 Six workload classes cover the intended deployment envelope, from database and analytics I/O to immutable backup pools. Each class has a target the roadmap must hit before the phase that delivers it is considered done, measured with the same interleaved A/B median protocol as the 1.x program and, from P0 onward, with fio against a mounted file system on real NVMe — the harness that was impossible in the 1.x container becomes mandatory once the io_uring daemon lands.
@@ -188,6 +219,19 @@ Throughput targets alone let a file system win benchmarks and lose applications,
 Every synchronous boundary is a throughput ceiling. The 1.x engine enters through FUSE, pays a kernel round trip per operation, and copies the payload twice; its block layer then calls synchronous read/write, serializing the whole engine against device latency. The 2.0 front door is a per-application io_uring: the daemon mmaps the submission and completion queues into the client, batches of SQEs are produced lock-free, and registered buffers let the device DMA land results directly in application memory. In steady state the submission path performs no syscalls at all — SQPOLL mode keeps a kernel thread consuming the ring, and the doorbell is required only when the ring transitions from empty to non-empty. Interrupt-driven completions are replaced by IOPOLL where the device supports it, trading a bounded amount of busy polling for interrupt-eliminated latency on the hot core. Figure 1 shows the four phases of the pipeline; the full step-by-step trace with per-step costs is Section 9.
 
 > **Figure 1:** I/O engine pipeline — submit, shard, execute, complete. *(diagram in the normative PDF)*
+
+Rendered from the normative Markdown source, the four phases of the pipeline:
+
+```mermaid
+flowchart LR
+    APP["application threads"] --> SQ["submission queue ring<br/>(mmap shared, lock-free SQE batches)"]
+    SQ --> SHARD["per-core engine shard<br/>cache probe, extent resolution, allocation"]
+    SHARD --> RING["device ring<br/>(registered buffers, SQPOLL)"]
+    RING --> MEDIA["NVMe, ZNS, SMR media<br/>(or SPDK queue pair in bypass mode)"]
+    MEDIA --> CQ["completion queue ring<br/>(IOPOLL or interrupt)"]
+    CQ --> DISP["completion dispatcher<br/>deferred checksum verify, CQE reap"]
+    DISP --> APP
+```
 
 | Parameter | Default | Rationale |
 |---|---|---|
@@ -234,6 +278,12 @@ fn shard_of(fd: Fd, ino: Ino) -> usize {
 ### 3.4 Tiered and direct memory access: CXL and DMA
 
 CXL-attached persistent memory enters the tier hierarchy as a byte-addressable cache and journal tier. Metadata leaves, the intent journal, and the dedup bloom filters are placed there first: the journal's fsync collapses to a cache-line writeback with CLWB plus a fence, roughly two orders of magnitude cheaper than a flash flush, which transforms the fsync-heavy workload class. Device DMA is steered into CXL memory for read-modify-write payloads (parity deltas, cluster recompression) so the transform never round-trips through DRAM it does not need. The engine treats the tier as a first-class placement target with its own bandwidth accounting rather than as a block device, because treating PMEM as a disk is precisely the anti-pattern that wastes it. Where the platform exposes DSFC or CXL III shared devices, the same descriptor path issues direct device-to-device DMA transfers for replication, copying pools without hosting bytes in DRAM at all.
+
+The journal-tier claim as an inequality — a cache-line writeback plus fence versus a device flush:
+
+$$t_{\mathrm{commit}}^{\mathrm{CXL}} = t_{\mathrm{CLWB}} + t_{\mathrm{fence}} \;\approx\; \frac{t_{\mathrm{flush}}^{\mathrm{NAND}}}{10^{2}}$$
+
+Because the fsync-heavy class is bounded by $\mathrm{IOPS}_{\mathrm{fsync}} \le 1 / (t_{\mathrm{barrier}} + t_{\mathrm{data}})$, moving the journal's barrier term from a flash flush to a CLWB writeback is what transforms that workload class quantitatively: the barrier drops out of the bound.
 
 - **0** — syscalls per steady-state operation (SQPOLL + registered buffers)
 - **1** — copy per read: the device DMA itself
@@ -284,6 +334,12 @@ A file smaller than 4 KiB is stored entirely inside the B-epsilon leaf that hold
 
 Above the inline threshold, extents live in a per-inode B-epsilon tree, the write-optimized structure of Bender and colleagues, whose internal nodes have large fanout and whose leaves are oversized buffers that absorb writes and flush lazily in sorted runs. For a file system this shape is precisely what the workload wants: allocations and truncations are leaf appends that amortize one internal-node rewrite across hundreds of mutations, while reads in the steady state hit the in-memory copy of the hot leaf and cost one comparison per level. The 1.x spill B-tree rewrites tree nodes on nearly every insert — which is a measurable fraction of why rand4k-write sat at +0.8 percent — and the B-epsilon leaf turns that into an append. Leaves are padded to 25 percent free space on flush so hot files do not split on every rewrite, and the flusher coalesces adjacent extents before writing, which is the second half of how the 8192-to-8 fragment result extends to arbitrary scales.
 
+The published B-epsilon bounds make the replacement quantitative. With leaves of $\Theta(B)$ records, internal fanout $B^{1-\varepsilon}$, and messages of $\lambda$ blocks:
+
+$$I(N) = O\!\left(\frac{\lambda \log N}{\varepsilon\, B^{1-\varepsilon}}\right) \ \text{(amortized insert)}, \qquad h = \frac{\log N}{(1-\varepsilon)\,\log B} \ \text{(index height)}$$
+
+Each internal-node rewrite is amortized across the $\Theta(B^{1-\varepsilon})$ buffered mutations a flush drains — the property that turns the 1.x per-insert node rewrite into a leaf append.
+
 | Property | Plain B-tree (1.x) | B-epsilon (2.0) | HAMT (namespace only) |
 |---|---|---|---|
 | Insert cost | rewrite internal nodes often | leaf append, lazy flush | O(1) rehash copy |
@@ -327,6 +383,14 @@ Integrity verification is split by temperature because checksum strength and che
 
 *Table 11: Integrity primitives and where each applies*
 
+The dual-speed split as a cost model — $D_{\mathrm{hot}}$ bytes verified on the completion path, $D_{\mathrm{cold}}$ bytes riding decompression:
+
+$$T_{\mathrm{csum}} = \underbrace{\frac{D_{\mathrm{hot}}}{\mathrm{thr}_{\mathrm{xxHash64}}}}_{\text{deferred to completion}} + \underbrace{\frac{D_{\mathrm{cold}}}{\mathrm{thr}_{\mathrm{BLAKE3}}}}_{\text{overlapped with decode}}, \qquad t_{\mathrm{xxHash64}}(4\ \mathrm{KiB}) = \frac{4096\ \mathrm{B}}{20 \times 10^{9}\ \mathrm{B/s}} \approx 0.2\ \mu\mathrm{s}$$
+
+and the closed 1.x gap's metadata price — a 16-byte BLAKE3 tag per 4 KiB block:
+
+$$\frac{16\ \mathrm{B}}{4096\ \mathrm{B}} = 0.39\% \approx 0.4\%$$
+
 ### 5.3 Autonomous repair
 
 Detection without repair is just surveillance. When a read or the scrubber finds a checksum mismatch, the offending block is quarantined in the bad-blocks tree, the scrubber allocates a fresh extent through the normal per-core allocator, reconstructs the data from P/Q parity (or from a mirror), writes it with a fresh checksum, and swaps the extent reference inside a first-class transaction — the same intent-log machinery as any other mutation, so a crash mid-repair heals into either the old or the new copy and never into neither. Repair is therefore autonomous: no operator action, no unmount, no fsck run. Pools without redundancy mark the block and report the loss event to the health bus rather than pretending. The scrub schedule is adaptive: pools with observed bit-rot history scrub hot regions first, and the scheduler prefers device idle windows so the healing path itself respects the latency SLO of foreground traffic.
@@ -340,6 +404,18 @@ Recovery is a five-state machine executed by the mount path, and every transitio
 3. CHECKPOINT: swap roots, rewrite superblocks, reset the journal.
 4. RECONCILE: merge bad-blocks and ZNS zone tables with device-reported state.
 5. WRITABLE: open rings, start shards, begin accepting submissions.
+
+The five states and their single obligations:
+
+```mermaid
+stateDiagram-v2
+    [*] --> PROBE
+    PROBE --> REPLAY: highest CRC-valid generation selected
+    REPLAY --> CHECKPOINT: committed transactions rolled forward, open discarded
+    CHECKPOINT --> RECONCILE: roots swapped, journal reset
+    RECONCILE --> WRITABLE: bad-blocks and zone tables merged with device reports
+    WRITABLE --> [*]
+```
 
 ## 6. Pillar IV: Hardware-Aware Tiering and Alignment
 
@@ -357,6 +433,20 @@ The allocator is a policy engine over device classes, and every policy is a func
 
 *Table 12: Media policy matrix*
 
+The ZNS write path, which replaces pre-reservation with completion-time extents:
+
+```mermaid
+flowchart TB
+    W["write on a ZNS host-managed pool"] --> F{"zone policy:<br/>target zone below 85 percent full?"}
+    F -->|"yes"| ZA["engine submits zone-append<br/>carrying the zone write-pointer token"]
+    F -->|"no"| NEW["open a fresh zone<br/>(one file per zone until 85 percent)"]
+    NEW --> ZA
+    ZA --> DEV["device places the write<br/>where its media wants"]
+    DEV --> RET["completion returns the placed offset"]
+    RET --> EXT["extent record written post-hoc,<br/>WAF approximately 1.0, FTL bypassed"]
+    RET --> WP["write-pointer token advanced<br/>for the next append"]
+```
+
 ### 6.2 Universal alignment guarantees
 
 Alignment is enforced at the three places misalignment can be introduced. At mkfs, the superblock records probed logical sector size, physical sector size, and optimal I/O size, and free-space regions are snapped to the optimal I/O boundary. At allocation, every extent request is rounded up to the device's page cluster class — 4, 16, or 64 KiB — with the rounding accounted as padding in the extent record's GRAN mode rather than as file size, so user-visible sizes never lie. At submission, I/O descriptors are split and merged so each device command is a multiple of the probed optimal size and offset-aligned to it; the engine keeps the 1.x debug counters that measure alignment violations, because a guarantee you do not measure is a hope. Misaligned requests can still occur from hostile unaligned user buffers — those are served through a bounce-buffer slow path with an explicit perf counter, visible in the health bus, never silently copied.
@@ -366,6 +456,12 @@ Alignment is enforced at the three places misalignment can be introduced. At mkf
 ### 7.1 Tiered adaptive compression
 
 The 128 KiB cluster scheme from 1.x is the substrate, and its measured behavior drives the 2.0 upgrades. A corpus of 40 percent repeating records, 35 percent dictionary text, and 25 percent incompressible bytes compressed 2.90x at zstd level 3 while writing at 407 MiB/s on a 2-vCPU container, and the level sweep showed the honest cliff: level 9 buys 0.08x more ratio for 6.8x the CPU. The 2.0 pipeline therefore adapts per inode: the first two clusters written measure compressibility and latency, and the policy engine pins the file to a tier — LZ4 for anything that must sustain line-rate writes (it decompresses at several GB/s per core and compresses fast enough to stay on the write path), zstd level 3 for warm bulk, zstd level 9-plus on the cold tier where write rate is irrelevant and ratio compounds across terabytes. Hardware acceleration is a first-class path, not an afterthought: Intel QAT devices compress and checksum entire clusters in flight, AVX-512 vectorizes the codec kernels themselves, and the transform pipeline selects among software, SIMD, and QAT backends per submission based on availability and queue depth, with the selection itself a measured decision recorded in the health bus.
+
+The honest cliff of the level sweep, as a marginal-efficiency ratio:
+
+$$\eta_{\mathrm{marginal}} = \frac{\Delta\,\mathrm{ratio}}{\Delta\,\mathrm{CPU}} = \frac{0.08}{6.8} \approx 1.2 \times 10^{-2}$$
+
+— the level-3 to level-9 step buys roughly 0.01 units of ratio per unit of CPU, which is where the warm/cold tier boundary is drawn.
 
 | Tier | Codec | Write path target | Integrity |
 |---|---|---|---|
@@ -378,9 +474,35 @@ The 128 KiB cluster scheme from 1.x is the substrate, and its measured behavior 
 
 The worst 1.x behavior — a random 4 KiB write into compressed data costing a full 128 KiB decompress-splice-recompress — is answered with a punch-through escape hatch: when the policy engine observes a third RMW against the same cluster, the cluster is transparently decompressed into raw extents, its ClusterTree entry is retired, and subsequent random writes hit the plain extent path. Write amplification on the transition is paid once instead of unboundedly. The reverse direction exists too: clusters that go cold and unmodified for a scrub cycle are re-compressed into the cold tier during idle windows, because backup pools deserve the compaction without the hot path ever paying for it.
 
+The tier decision and both escape hatches:
+
+```mermaid
+flowchart TB
+    IN["cluster write (128 KiB)"] --> M["first two clusters per inode:<br/>measure compressibility and latency"]
+    M --> PIN["policy engine pins the file to a tier"]
+    PIN --> HOT["hot: LZ4 block<br/>xxHash64 per page"]
+    PIN --> WARM["warm: zstd level 3<br/>BLAKE3 per cluster"]
+    PIN --> COLD["cold: zstd level 9+ or QAT<br/>BLAKE3 per cluster"]
+    HOT --> DEC{"compressed ratio at least 1.2?"}
+    WARM --> DEC
+    COLD --> DEC
+    DEC -->|"incompressible"| RAW["raw extents, RAW flag,<br/>xxHash64 per page"]
+    DEC -->|"compressible"| CL["compression cluster<br/>with integrity tag"]
+    CL --> R3{"third read-modify-write<br/>against the same cluster?"}
+    R3 -->|"yes"| PT["punch-through: decompress into raw extents,<br/>retire the ClusterTree entry"]
+    R3 -->|"no"| STAY["stay clustered"]
+    PT --> RAW
+    CL --> IDLE["idle windows: cold, unmodified clusters<br/>re-compress into the cold tier"]
+    IDLE --> CL
+```
+
 ### 7.2 Inline deduplication with content-defined chunking
 
 Cold and backup pools deduplicate inline. Chunks are cut with FastCDC-style content-defined chunking — expected size 8 KiB, min 2 KiB, max 32 KiB — so insertions and deletions shift cut points only locally and identical content chunks identically regardless of file alignment. Each chunk is hashed (BLAKE3-128), and the hash is probed against a three-level index: a small in-RAM bloom filter over the whole pool, a bounded LRU of hot chunk hashes, and the on-disk hash tree consulted only when the filters say maybe. Duplicate hits append a reference to the existing chunk extent under the refcount tree the 1.x format already defines; misses write the chunk once. The memory budget is explicit and bounded: the bloom filter and hot cache together default to 0.1 percent of pool size in RAM (1 GB per TB), and the honest consequence — a cold duplicate costs one hash-tree walk — is recorded in Section 10 rather than hidden. Inline dedup is disabled on hot pools by default because deduplication randomizes layout, and Section 10 prices that trade too.
+
+The bounded index budget as a formula:
+
+$$\mathrm{RAM}_{\mathrm{dedup\ index}} = 10^{-3} \times C_{\mathrm{pool}} \approx 1\ \mathrm{GiB\ per\ TiB}$$
 
 ```rust
 // Cluster write decision (per 128 KiB cluster)
@@ -478,6 +600,29 @@ This section traces one 1 MiB read and one 1 MiB write from the application call
 
 > **Figure 5:** Write lifecycle — CoW transaction pipeline with crash points. *(diagram in the normative PDF)*
 
+The write pipeline of Table 18, with both flush points and the crash points of Section 9.5:
+
+```mermaid
+sequenceDiagram
+    participant App as application
+    participant Shard as engine shard
+    participant Tx as transaction manager and journal
+    participant Ring as io_uring device rings
+    participant Dev as RAID5 pool devices
+    App->>Shard: write 1 MiB, pages stage in tx buffer
+    Shard->>Shard: reserve speculative aligned extent (lock-free)
+    Shard->>Tx: transaction joins the next group-commit batch
+    Tx->>Tx: append intent records, fdatasync (flush 1)
+    Tx->>Ring: submit data, metadata, parity, FUA on the final ring (flush 2)
+    Ring->>Dev: batched device commands
+    Dev-->>Ring: completions (IOPOLL or interrupt)
+    Ring-->>Tx: CQEs reaped, deferred checksums verified
+    Tx->>Tx: commit record, one tagged 4 KiB journal block
+    Tx-->>Shard: batch complete, fsync SLO satisfied
+    Shard-->>App: write visible and durable
+    Note over Tx,Dev: crash points: pre-intent, mid-data, post-data, post-commit, mid-checkpoint
+```
+
 | # | Step | Component | Cost target |
 |---|---|---|---|
 | 1 | dirty 4 KiB pages stage in the shard's tx buffer; batch flush at 64 KiB or fsync | core, per-shard | amortized |
@@ -508,6 +653,12 @@ rings.submit(data(batch) + parity(batch), fua=LAST) // device flush 2
 journal.append(commit_record(batch))                // close
 for w in batch: complete(w)                         // CQEs to every fsyncer
 ```
+
+The group-commit amortization in formulas — two device flushes per batch (intent fdatasync, FUA on the final ring submission), bounded by time and bytes rather than writer count:
+
+$$t_{\mathrm{fsync}}^{\mathrm{amortized}} = \frac{2\, t_{\mathrm{flush}}}{n_{\mathrm{batch}}}, \qquad n_{\mathrm{batch}} = \min\!\left(N_{\mathrm{ready}},\ \left\lceil \frac{W_{\max}}{w_{\mathrm{txn}}} \right\rceil,\ \left\lceil r_{\mathrm{arr}} \cdot T_{\mathrm{window}} \right\rceil\right)$$
+
+with $T_{\mathrm{window}} = 5\ \mathrm{ms}$ and $W_{\max} = 1\ \mathrm{MiB}$: sixty-four concurrent fsyncers pay $2\,t_{\mathrm{flush}}/64$ each instead of $2\,t_{\mathrm{flush}}$ each, and the flush count per fsync drops to $1/n_{\mathrm{batch}}$ — the durability SLO's arithmetic.
 
 ### 9.5 Failure injection and proof obligations
 

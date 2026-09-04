@@ -12,3 +12,16 @@ Examples of behavior that contributes to a positive environment for our communit
 * Demonstrating empathy and kindness toward other people
 * Being respectful of differing opinions, viewpoints, and experiences
 * Giving and gracefully accepting constructive feedback
+
+## How the pledge and the standards connect
+
+```mermaid
+flowchart LR
+    PLEDGE["Our pledge"] --> STD["Our standards"]
+    STD --> B1["Empathy and kindness"]
+    STD --> B2["Respect for differing opinions and experiences"]
+    STD --> B3["Constructive feedback, given and accepted"]
+    B1 --> COMM["Harassment-free, open, diverse, inclusive, healthy community"]
+    B2 --> COMM
+    B3 --> COMM
+```

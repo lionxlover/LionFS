@@ -15,6 +15,28 @@ lazily. For a filesystem this shape fits the workload precisely:
 - leaves pad to 25% free space on flush, so hot files do not re-split;
 - the flusher coalesces adjacent extents before writing.
 
+Write and read paths:
+
+```mermaid
+flowchart TB
+    I["insert(k, v): an upsert into the owning leaf buffer"] --> T{"buffer at the 2 KiB<br/>flush threshold?"}
+    T -->|"no (hot)"| H["steady-state reads hit<br/>the in-memory leaf"]
+    T -->|yes| CO["coalesce adjacent Extent16 runs<br/>before writing anything"]
+    CO --> FL["flush: pad the leaf to 25 percent free<br/>children compact, not split"]
+    FL --> RT{"root leaf?"}
+    RT -->|yes| SP["split into an internal root<br/>with two padded children"]
+    RT -->|no| RW["one internal-node rewrite<br/>amortized over the batch"]
+```
+
+Amortized insert cost (Bender et al.):
+$O\!\left(\frac{\log N}{\epsilon \log B}\right)$ — or
+$O(\frac{\log N}{\epsilon})$ with node size $B$ fixed by the leaf
+capacity — against a B-tree's $O(\log N)$ per insert. The padding
+factor sets the leaf-path write amplification, and the flush
+threshold sets the amortization batch:
+
+$$u = \frac{\text{live}}{\text{live} + \text{pad}} = 0.75, \qquad \mathrm{WA} = \frac{1}{u} = \frac{4}{3}, \qquad n_{\text{appends/flush}} \approx \frac{2048\ \mathrm{B}}{16\ \mathrm{B}} = 128$$
+
 ### Structure
 
 ```rust
@@ -62,3 +84,26 @@ Properties tested: persistence (old generations immutable), upsert
 replaces, large-population roundtrips (100k keys), remove persists +
 collapses branches, depth stays shallow (<8 for 100k keys), full-hash
 collision chains, structural-sharing sanity.
+
+Lookup shape:
+
+```mermaid
+flowchart TB
+    K["u128 key (inode number)"] --> HX["splitmix64 folded over the 128 bits"]
+    HX --> R["root: 32-way, bitmap-compressed node"]
+    R --> N1["one 5-bit nibble per level<br/>selects the slot"]
+    N1 --> N2["levels 2..d<br/>(shallow in practice)"]
+    N2 --> V["value: inode record or subtrie"]
+    HX -. "same full hash" .-> C["Collision node:<br/>chains the colliding keys"]
+    R -. "insert / remove" .-> P["new generation shares structure;<br/>only an O(depth) spine is copied;<br/>readers keep the old root (RCU publish)"]
+```
+
+Expected depth is logarithmic in the branching factor:
+
+$$d = \lceil \log_{32} N \rceil, \qquad \log_{32}(10^5) \approx 3.33 \Rightarrow d = 4 \;\; (\text{tested bound: } d < 8)$$
+
+while exhausting the full key takes $\lceil 128/5 \rceil = 26$
+levels (the "~26 levels worst case" above). Persistence costs one
+spine copy per mutation:
+
+$$\text{copied nodes} \le d \approx \lceil \log_{32} N \rceil$$

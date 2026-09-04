@@ -20,6 +20,27 @@ device-local runs sort together. Composition is width-checked
 (`compose` returns `None` on overflow); `advance_blocks` uses checked
 arithmetic; `same_stripe` tests run coalescability.
 
+Bit layout, most significant first:
+
+```mermaid
+flowchart LR
+    V["bits 127-112<br/>volume_id (16)<br/>subvolume / container selector"] --- R["bits 111-88<br/>region (24)<br/>stripe or band"]
+    R --- D["bits 87-64<br/>device (24)<br/>pool member, 16.7 M max"]
+    D --- L["bits 63-0<br/>device_lba (64)<br/>4 KiB units"]
+```
+
+The arithmetic behind "2^140 bytes":
+
+$$2^{128} - 1 \approx 3.4 \times 10^{38} \quad \text{(max address value)}$$
+
+$$2^{128}\ \text{addresses} \times 2^{12}\ \mathrm{B} = 2^{140}\ \mathrm{B} \approx 1.4 \times 10^{42}\ \mathrm{B}$$
+
+Per-field ceilings: `device_lba` alone reaches $2^{64}$ blocks
+$\times\ 4\ \mathrm{KiB} = 2^{76}\ \mathrm{B} = 64\ \mathrm{ZiB}$ per
+device, and byte-to-LBA conversion is exact:
+
+$$\mathrm{LBA} = \left\lfloor \mathrm{offset} / 2^{12} \right\rfloor$$
+
 The 256-bit alternative was analyzed and rejected (RFC-002 §10): no
 shipping medium approaches 2^40 blocks while wider keys measurably
 split cache lines and slow hashing.
@@ -65,3 +86,15 @@ Semantics:
 `LBA_BLOCK_BYTES` (4 KiB) matches the 1.x `BLOCK_SIZE`, so the two
 address spaces interoperate; the v2→v3 upgrade path maps 64-bit block
 numbers into `device_lba` with `volume_id`/`region`/`device` zeroed.
+
+## Address lifecycle
+
+```mermaid
+flowchart TB
+    C["compose(volume, region, device, lba)"] --> W{"width check<br/>(every field fits)"}
+    W -->|overflow| N["None - never truncation"]
+    W -->|fits| A["advance_blocks(n)<br/>checked arithmetic"]
+    A --> T{"same_stripe?"}
+    T -->|yes| M["coalescable_with:<br/>logical and physical adjacency<br/>plus flag identity"]
+    T -->|no| K["separate extent run<br/>(device-local runs still sort together)"]
+```

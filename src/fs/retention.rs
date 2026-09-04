@@ -8,16 +8,21 @@
 //! nothing at all (snapshot trees pinning CoW extents forever --
 //! capacity death by retention).
 //!
-//! The 3.0 policy is the classic GFS shape, expressed as tier budgets:
+//! The 3.0 policy is the classic GFS shape, expressed as tier
+//! budgets (tuned in 3.1, the ③ tuning pass):
 //!
-//! * **Hourly** tier: the last N hourly snapshots (default 24).
+//! * **Hourly** tier: the last N hourly snapshots (tuned 48; was
+//!   24 -- two full days of recovery points, so weekend batch
+//!   damage discovered on Monday still has hourly granularity).
 //! * **Daily**: one per calendar day, the newest snapshot of that
 //!   day, for the last M days (default 14).
 //! * **Weekly**: one per ISO week, newest of the week, last W weeks
 //!   (default 8).
 //! * **Monthly**: one per calendar month, newest of the month, last
 //!   X months (default 12).
-//! * **Yearly**: one per year, newest, last Y years (default 3).
+//! * **Yearly**: one per year, newest, last Y years (tuned 7; was
+//!   3 -- the seven-year horizon covers SOX-style document
+//!   retention without an operator override).
 //!
 //! Selection is *additive*: a snapshot that serves as the daily (or
 //! weekly...) representative is never also consumed by the hourly
@@ -29,8 +34,9 @@
 //! (`secs / 86_400`) and ISO weeks per RFC 3339 (weeks starting
 //! Monday; week 1 = the week with the year's first Thursday).
 
-/// Retention tier budgets. Defaults: 24 hourly, 14 daily, 8 weekly,
-/// 12 monthly, 3 yearly.
+/// Retention tier budgets. Tuned 3.1 defaults: 48 hourly, 14 daily,
+/// 8 weekly, 12 monthly, 7 yearly (was 24/14/8/12/3; rationale in
+/// the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionPolicy {
     pub hourly: usize,
@@ -43,11 +49,11 @@ pub struct RetentionPolicy {
 impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {
-            hourly: 24,
+            hourly: 48,
             daily: 14,
             weekly: 8,
             monthly: 12,
-            yearly: 3,
+            yearly: 7,
         }
     }
 }
@@ -233,22 +239,24 @@ mod tests {
 
     #[test]
     fn hourly_budget_keeps_newest_n() {
-        // 30 hourly snapshots; default keeps 24, expires 6 oldest.
-        let times: Vec<u64> = (0..30).map(|i| 1_700_000_000 + i * HOUR).collect();
+        // 60 hourly snapshots; the tuned default keeps the newest 48
+        // hourly plus daily representatives, expiring the rest.
+        let times: Vec<u64> = (0..60).map(|i| 1_700_000_000 + i * HOUR).collect();
         let snaps = snaps_at(&times);
         let r = apply_retention(&snaps, &RetentionPolicy::default());
-        assert_eq!(r.keep.len() + r.expire.len(), 30);
+        assert_eq!(r.keep.len() + r.expire.len(), 60);
         // Every snapshot is in exactly one set.
         assert!(!r.keep.is_empty());
-        // The newest 24 hourly... daily representatives may pull older
+        // The newest 48 hourly... daily representatives may pull older
         // ones into keep, so expire is the tail older than what any
         // tier wants.
-        assert_eq!(r.expire.len(), 30 - r.keep.len());
-        // The oldest snapshot (id 1) is expired: 30 hours spans < a
-        // day boundary? 1.7e9 + 30h... all within ~1.25 days: only the
-        // newest daily representative survives; older-than-hourly-24
-        // entries within the same day are redundant and expire.
+        assert_eq!(r.expire.len(), 60 - r.keep.len());
+        // The oldest snapshot (id 1) is expired: 60 hours spans ~2.5
+        // days; the oldest day's non-hourly representatives are its
+        // newest snapshots, not its oldest -- id 1 is redundant to
+        // every tier and expires.
         assert!(r.expire.contains(&1));
+        assert!(r.keep.len() >= 48, "hourly floor: {}", r.keep.len());
     }
 
     #[test]

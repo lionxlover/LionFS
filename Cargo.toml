@@ -1,6 +1,6 @@
 [package]
 name = "lionfs"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Lion"]
@@ -285,3 +285,7 @@ panic = "unwind"
 [profile.bench]
 opt-level = 3
 lto = "thin"
+
+[[bin]]
+name = "lfs_simulate"
+path = "tools/simulate/main.rs"

@@ -97,3 +97,48 @@ storage efficiency):
 
 GF(256) caps n at 255 shards (asserted); wider pools need
 bytes-per-word growth, which is explicitly out of scope and stated.
+
+## Recovery state machine (diagram)
+
+```mermaid
+stateDiagram-v2
+    [*] --> PROBE
+    PROBE --> REPLAY: highest valid generation chosen
+    PROBE --> FAIL: no CRC-valid superblock copy
+    REPLAY --> CHECKPOINT: committed rolled forward, open discarded
+    CHECKPOINT --> RECONCILE: roots swapped, journal reset
+    RECONCILE --> WRITABLE: device report merged in
+    WRITABLE --> [*]: accept submissions
+    FAIL --> [*]: mount refused explicitly
+```
+
+A fault injected at any boundary, re-run converges (the §9.5 property;
+tested at every named kill-point).
+
+## RS(n, k) geometry (diagram)
+
+```mermaid
+flowchart LR
+    DS["k data shards"] --> MTX["encoding matrix M = V·V_k⁻¹<br/>(n × k, MDS by construction)"]
+    MTX --> SYST["data shards stored as-is<br/>(systematic top rows)"]
+    MTX --> PAR["n − k parity shards<br/>(table-driven XOR folds)"]
+    SURV["any k of n shards survive"] --> GJ["Gauss-Jordan on the k × k<br/>GF(256) system"]
+    SYST --> SURV
+    PAR --> SURV
+    GJ --> RE["reconstruct erased shards, re-encode"]
+```
+
+## Erasure-coding loss probability
+
+RS(n, k) tolerates exactly $n - k$ concurrent device losses; with
+independent per-device failure probability $p$, data is lost only when
+more than $n - k$ devices fail:
+
+$$P_{\mathrm{DL}} = \sum_{j = n-k+1}^{n} \binom{n}{j}\, p^{j}\,
+(1-p)^{n-j}, \qquad \eta = \frac{k}{n}$$
+
+For RS(10, 6): four concurrent losses tolerated at 60% storage
+efficiency — $P_{\mathrm{DL}}$ is the probability of five or more
+simultaneous failures. The property tests check the MDS behavior
+directly instead: 200 rounds of random erasure sets, any k of n
+recovers.

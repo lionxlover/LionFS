@@ -31,3 +31,68 @@ extern LfsApiStatus lfs_mount_fuse(const char* device, const char* mount_point);
 ```
 
 This ensures that storage administration GUIs, backup suites, and virtualization platforms can dynamically link to `liblionfs.so` directly, driving the filesystem at maximum performance directly from C, C++, Go, or Python.
+
+## 4. Request Path (FUSE today, kernel tomorrow)
+
+The same VfsOps surface serves all three deployment modes; the live
+path today is FUSE:
+
+```mermaid
+sequenceDiagram
+    participant APP as application
+    participant K as kernel VFS
+    participant F as fuser bridge
+    participant V as VfsOps impl
+    participant E as io_engine
+    participant D as NVMe device
+    APP->>K: pwrite syscall
+    K->>F: FUSE request
+    F->>V: VfsOps write
+    V->>E: IoOp submit to shard
+    E->>D: batched io_uring_enter
+    D-->>E: completion CQE
+    E-->>V: Completion
+    V-->>F: op result
+    F-->>K: FUSE reply
+    K-->>APP: syscall return
+```
+
+In the rust-for-linux port, the kernel VFS calls the `#[repr(C)]`
+operation structs directly and the two FUSE hops collapse into
+function calls -- the ABI work in section 1 makes that a relinking,
+not a redesign.
+
+## 5. Deployment modes
+
+```mermaid
+flowchart TB
+    MODES["three deployment modes"]
+    MODES --> M1["FUSE via fuser - ships today"]
+    MODES --> M2["liblionfs C ABI - direct linkage"]
+    MODES --> M3["native kernel - rust-for-linux design"]
+    M1 --> CORE["shared VfsOps core"]
+    M2 --> CORE
+    M3 --> CORE
+    CORE --> REPR["repr C zero-copy structs"]
+```
+
+## 6. Latency Budget Decomposition (model, not measurement)
+
+No latency numbers exist in this repository; `docs/performance.md`
+says so and this section does not contradict it. What can be written
+honestly is the decomposition each mode must satisfy. A FUSE write
+pays
+
+$$R_{\mathrm{fuse}} = t_{\mathrm{sys}} + t_{\mathrm{kfuse}} + t_{\mathrm{bridge}} + t_{\mathrm{core}} + t_{\mathrm{engine}} + t_{\mathrm{dev}} + t_{\mathrm{reply}}$$
+
+where $t_{\mathrm{kfuse}}$ and $t_{\mathrm{reply}}$ are the
+kernel-to-daemon round trip. The native port eliminates those terms
+and the userspace copy, leaving
+
+$$R_{\mathrm{native}} \approx t_{\mathrm{sys}} + t_{\mathrm{core}} + t_{\mathrm{engine}} + t_{\mathrm{dev}}$$
+
+The floor of both is $t_{\mathrm{dev}}$ -- the eliminated terms are
+context switches and copies, never device time. Group commit amortizes
+the durability term inside $t_{\mathrm{engine}}$ across a batch of $B$
+concurrent fsyncers: per-writer flush cost $t_{\mathrm{flush}}/B$, and
+the documented batch window seats $B = 64$.

@@ -76,3 +76,38 @@ precondition, tracked in the roadmap.
   between platforms is a bug in a bridge, not a feature.
 - errno values cross the bridge unchanged — they are already the wire
   ABI.
+
+## Dispatch path (diagram)
+
+```mermaid
+flowchart LR
+    K["kernel syscall<br/>(FUSE or WinFsp)"] --> BR["bridge: fuser or WinFsp,<br/>translation only, no policy"]
+    BR --> OPS["vfs::VfsOps, one impl<br/>(src/fs/vfs_impl.rs)"]
+    OPS --> TX["active_tx batching,<br/>commit at 1024 dirty blocks, flush, fsync"]
+    TX --> ENG["engine: shard submit<br/>(QoS gate, then tree or record log)"]
+    ENG --> CMPL["completion as Result returns,<br/>errno values cross unchanged"]
+```
+
+Bridges translate; the single `VfsOps` implementation is where policy
+lives — a behavioral difference between platforms is a bug in a
+bridge, not a feature.
+
+## Syscall budget decomposition
+
+Per call, the budget is additive across the layers:
+
+$$t_{\text{sys}} = t_{\text{bridge}} + t_{\text{vfs}} + t_{\text{tx}} +
+t_{\text{io}}$$
+
+$t_{\text{bridge}}$ is O(1) — delegation and errno mapping, no copies
+beyond the FUSE ABI's own; $t_{\text{vfs}}$ is the ported 1.x logic
+(lookup, permission check, extent resolution). The batched terms
+amortize: commits fire at more than 1024 dirty blocks, so under
+sustained writes each commit's cost divides over the batch,
+
+$$t_{\text{commit per block}} = \frac{c_{\text{fsync}} +
+c_{\text{journal}}}{1024}, \qquad
+t_{\text{io}} \approx \frac{\bar p}{B} + \frac{c}{n_{\text{batch}}}$$
+
+The `.lfs_scrub` / `.lfs_health` control files are reads at fixed
+inodes (999999/999998): constant cost, no transaction, no allocation.

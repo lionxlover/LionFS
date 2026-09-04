@@ -4,6 +4,39 @@ This tracks what's actually built versus planned. See `README.md` for
 the user-facing status; this is the phase-by-phase view against the
 LFS-RFC-002 P0-P6 program and the RFC-003 platform deliverables.
 
+## Phase graph
+
+```mermaid
+stateDiagram-v2
+    direction TB
+    [*] --> P1
+    P1 : Phase 1 Core foundation - done
+    P1 --> P2
+    P2 : Phase 2 Structural scaling - mostly done
+    P2 --> P3
+    P3 : Phase 3 Modern data safety - done, wired into the live path
+    P3 --> P4
+    P4 : Phase 4 Enterprise scalability - advanced in 2.0
+    P4 --> P5
+    P5 : Phase 5 The 2.0 architecture - implemented, integrating
+    P5 --> P6
+    P6 : Phase 6 Cross-platform - RFC-003 deliverables
+    P6 --> P7
+    P7 : Phase 7 The 3.0 release - RFC-004, eleven subsystems
+    P7 --> P8
+    P8 : Phase 8 The wiring - done in 3.1
+    P8 --> P9
+    P9 : Phase 9 Scaling out - open
+    P9 --> [*]
+```
+
+The exit criterion in one line: a checkbox flips to `[x]` only with
+the full suite green — the count has only ever moved up,
+$245 \to 462 \to 638 \to 713$ — and every wiring step measured under
+the interleaved A/B protocol (RFC-002 2.4). Phase 8 closed 7 of its 8
+entries, $\frac{7}{8} = 87.5\%$; the open entry — the xfstests port
+and the journal TLA+ model — is Phase 9-scoped.
+
 ## Phase 1: Core Foundation — done
 - [x] Extent-based layout, contiguous block allocator, 256-byte inodes
 - [x] FUSE integration: create/read/write/lookup/mkdir/unlink/rename (incl. cross-directory)/setattr/statfs/access
@@ -68,23 +101,40 @@ LFS-RFC-002 P0-P6 program and the RFC-003 platform deliverables.
 - [x] **GFS retention** + **online rebalance** (daemon loops: Phase 8)
 - [x] Test suite 462 → **638**; four new tools with runnable
       simulations (`lfs_guardian/migrate/gc/retention`)
+- [x] **3.1 tuned defaults** (③): GC watermarks 25/10 (was 20/8),
+      wear 8 bps, 5-day half-life, 12-segment plans; retention
+      48h/14d/8w/12m/7y (was 24/14/8/12/3); per-class QoS rates with
+      8:4:1 WFQ weights
 
-## Phase 8: The 3.0 wiring (the A/B-measured switches)
-- [ ] Record journal onto the small-write path (interleaved with the
-      2.0 path, measured per RFC-002 §2.4)
-- [ ] QoS admission into the shard dispatcher; WFQ into group-commit's
-      batch pick
-- [ ] GC-planner → scrubber → allocator execution loop
-- [ ] Retention into the snapshot daemon; rebalance into the pool
-      manager
-- [ ] Guardian onto the live telemetry socket; Prometheus onto the
-      health socket
-- [ ] Migration tooling onto the real tar stream
-- [ ] Key-envelope prompts in mkfs/mount; rewrap tool
-- [ ] The deterministic full-stack simulator over the 3.0 policy set
-      (FoundationDB-style; all policy objects already take
-      caller-supplied time)
-- [ ] xfstests port; journal TLA+ model
+## Phase 8: The 3.0 wiring (the A/B-measured switches) — done in 3.1
+- [x] Record journal onto the small-write path: `wiring::small_write`
+      (route switch, window policy, read overlay, checkpoint drain,
+      post-crash overlay rebuild from replay; measured per RFC-002
+      §2.4 via the router's route counters)
+- [x] QoS admission into the shard dispatcher; WFQ into
+      group-commit's batch pick: `wiring::qos_gate` (token-bucket
+      admission with the Realtime guarantee; WFQ batch pick with
+      tuned 8:4:1 weights)
+- [x] GC-planner → scrubber → allocator execution loop:
+      `wiring::gc_loop` (census → plan → evacuate → reclaim-event
+      feedback; Bulk class, rate-unlimited panic mode)
+- [x] Retention into the snapshot daemon; rebalance into the pool
+      manager: `wiring::retention_daemon` (interval-rate-limited GFS
+      passes; balanced-terminating rebalance rounds)
+- [x] Guardian onto the live telemetry socket; Prometheus onto the
+      health socket: `wiring::telemetry_bridge` (19 bounded series,
+      both sockets scrape one object)
+- [x] Migration tooling onto the real tar stream:
+      `wiring::tar_stream` (ustar parser + ImportSink + manifest +
+      SHA-256 read-back verification)
+- [x] Key-envelope prompts in mkfs/mount; rewrap tool:
+      `wiring::key_flow` (create/unlock/lockout/rotation with the
+      audit trail)
+- [x] The deterministic full-stack simulator over the 3.0 policy set
+      (FoundationDB-style): `sim` + `sim::crash` (seeded universes,
+      exhaustive crash-point sweeps, replay invariants as
+      assertions) + the `lfs_simulate` tool
+- [ ] xfstests port; journal TLA+ model (Phase 9)
 
 ## Phase 9: Scaling out
 - [ ] SPDK bypass plane (RFC-002 P6, opt-in per pool)
@@ -107,3 +157,23 @@ LFS-RFC-002 P0-P6 program and the RFC-003 platform deliverables.
 - Locality/best-fit allocation policies exist but the live allocator
   remains first-fit; the shard free-queues are the integration point.
 - WinFsp mounting on Windows is the last platform gap.
+
+## Where the remaining work goes
+
+```mermaid
+flowchart LR
+    G1["Structures and policies tested beside the live paths"] --> AB["Interleaved A/B switch protocol (RFC-002 2.4)"]
+    G2["Repair planning without automated repair"] --> W2["Scrubber to healer to allocator wiring"]
+    G3["Live allocator is first-fit"] --> W3["Shard free-queues as the integration point"]
+    G4["No Windows mounting"] --> W4["WinFsp bridge (RFC-003 binding design)"]
+    AB --> P9["Phase 9 and beyond"]
+    W2 --> P9
+    W3 --> P9
+    W4 --> P9
+```
+
+Counting the open surface: Phase 8 has one open entry, Phase 9 lists
+four, and the partially-done Phase 2 and Phase 4 items land on the
+same switch protocol — the remaining wiring concentrates in Phase 9:
+
+$$|\mathrm{Phase\ 8\ open}| = 1, \qquad |\mathrm{Phase\ 9}| = 4\ \mathrm{open\ items}$$

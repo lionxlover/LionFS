@@ -214,7 +214,7 @@ Rosenblum-Ousterhout cost/benefit, extended:
   leveling: don't farm one segment forever);
 - **score** = benefit/cost, highest-first.
 
-Watermarks: idle above 20% free; **background trickle** 20%→8%;
+Watermarks (tuned 3.1): idle above 25% free; **background trickle** 25%→10%;
 **panic mode** below 8% — score ordering degrades to pure
 freeable-bytes (at 8% free the correct move is to reclaim now, not be
 clever). Plans are capped (`max_segments_per_plan`, default 8) and
@@ -340,8 +340,9 @@ per-file key = HMAC-SHA256(master, "LFS3/file-key/v1" || file_id)
 
 ### 12.1 Snapshot retention (`src/fs/retention.rs`)
 
-GFS with tier budgets: 24 hourly / 14 daily / 8 weekly / 12 monthly /
-3 yearly (defaults; operator-tunable). Selection is **additive** — a
+GFS with tier budgets: 48 hourly / 14 daily / 8 weekly / 12 monthly /
+7 yearly (tuned 3.1 defaults, were 24/14/8/12/3; operator-tunable).
+Selection is **additive** — a
 snapshot serving as a day's representative is never also consumed by
 the hourly budget. Calendar math is integer (Hinnant's
 civil-from-days; the `y + (m <= 2)` adjustment is load-bearing) with
@@ -390,27 +391,74 @@ check (±1% of capacity slack).
 | PBKDF2 vs. Argon2 | GPU-attack cost per guess is lower | zero new deps, 30 auditable lines, Windows stays std-only | 600k iterations + AEAD tags; Argon2 is a drop-in later |
 | Digest dedup for layers | digest computation on pull | 5-10× sharing on container hosts | composes with existing chunk dedup |
 
-## 15. Phasing
+## 15. Phasing — and the 3.1 wiring (§15.1)
 
-- **Phase 7 (this release):** all policy layers + structures
-  implemented and tested beside the live 2.0 paths, runnable through
-  the four tools (`lfs_guardian/migrate/gc/retention`), metrics
-  registry exportable.
-- **Phase 8 (wiring):** switch the write path onto the record
-  journal; GC-planner → scrubber → allocator loop; QoS admission into
-  the shard dispatcher and group-commit pick; retention into the
-  snapshot daemon; rebalance into the pool manager; Guardian onto the
-  live telemetry socket; Prometheus onto the health socket; migration
-  tooling onto the real tar stream. Each switch under the interleaved
-  A/B measurement protocol (RFC-002 §2.4).
+- **Phase 7 (3.0):** all policy layers + structures implemented and
+  tested beside the live 2.0 paths, runnable through the four tools
+  (`lfs_guardian/migrate/gc/retention`), metrics registry exportable.
+- **Phase 8 (3.1, done):** the wiring is in — see §15.1.
 - **Phase 9 (scaling):** SPDK bypass plane (RFC-002 P6), CXL journal
-  on real hardware, WinFsp bridge, the deterministic full-stack
-  simulator.
+  on real hardware, WinFsp bridge, PAX-format tar members, xfstests
+  port, journal TLA+ model.
+
+### §15.1 The Phase 8 wiring (LionFS 3.1, implemented)
+
+Every policy layer now sits on the path it governs, behind
+`src/wiring/` seams whose contract is uniform: the engine owns the
+thread, the wiring owns the `step(now_ns, …)`, every decision is a
+pure function of caller-supplied time, and every switch carries A/B
+counters. Normative detail: [`specifications/wiring.md`](../../specifications/wiring.md).
+
+```mermaid
+flowchart TB
+    subgraph paths["Live engine paths (Phase 8)"]
+        direction LR
+        W[submit] --> QG["QosShardGate<br/>quota → tokens"]
+        QG --> SW["small-write switch<br/>≤4032 B → record log"]
+        SW --> OV["read overlay<br/>+ checkpoint drain"]
+        QG --> WFQ["GroupCommitPicker<br/>WFQ 8:4:1 batch order"]
+    end
+    subgraph daemons["Daemon steps"]
+        GC["GcExecutionLoop<br/>census→plan→evacuate→feedback"]
+        RD["RetentionDaemon +<br/>RebalanceDriver"]
+        TB["GuardianTelemetryBridge<br/>19 series, both sockets"]
+    end
+    subgraph mount["Boot paths"]
+        KP["KeyPromptFlow /<br/>MountGate (3-strike)"]
+        TI["TarImportSession<br/>ustar → verify"]
+    end
+    SIM["sim::crash — seeded universes,<br/>exhaustive crash-point sweeps"]
+    paths -. invariants .-> SIM
+    daemons -. determinism .-> SIM
+```
+
+The tuned defaults shipped with the wiring (the ③ pass): GC
+watermarks **kick 25% / aggressive 10%** (background band 12 → 15
+points — $t_{\text{panic}} = (\text{kick}-\text{aggressive})/(f-r)$
+buys 25% more burst runway); retention **48 hourly / 7 yearly**;
+QoS per-class rates (RT 16 GiB/s, BE 4 GiB/s, bulk 1 GiB/s) with
+WFQ weights **8:4:1** ($S_i/S_j \to w_i/w_j$ under saturation).
+
+The deterministic simulator (§13's Phase 9 promise, pulled into 3.1
+because the wiring made it cheap): seeded `SimRng` universes, power
+cuts at deterministic op indexes and tear offsets, and replay
+invariants asserted — the **prefix property** (replay = ledger
+prefix), **overlay convergence** (writer view == replay-rebuilt
+view), torn-tail discipline, determinism. The exhaustive sweep
+makes every crash point a test case:
+
+$$N_{\text{universes}} = |\text{seeds}| \times N_{\text{ops}}
+\times |\text{tear offsets}|$$
+
+Tool: `lfs_simulate run|sweep|determinism`. Test suite:
+638 → **713**.
 
 ---
 
 *RFC-004 §15 closes with the same discipline it opened with: the 3.0
-subsystems are consultative layers over an unchanged, crash-tested
-substrate. Unlimited capacity is an option, not an obligation; the AI
-is in the observatory, not the kernel; and every new promise in this
-file is attached to a test that keeps it honest.*
+subsystems were consultative layers over an unchanged, crash-tested
+substrate; the 3.1 wiring puts each on its live path without moving a
+floor joist, and the simulator proves the stack's decisions are
+functions of two numbers. Unlimited capacity is an option, not an
+obligation; the AI is in the observatory, not the kernel; and every
+new promise in this file is attached to a test that keeps it honest.*

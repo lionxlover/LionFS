@@ -27,6 +27,22 @@ first-class: one comparison ordering names a byte of PMEM, a block of
 NVMe, and a sector of SMR. `Ord` is field order (device-local runs
 sort together), matching `VolumeAddr`'s discipline.
 
+Field layout, most significant first:
+
+```mermaid
+flowchart LR
+    D["255-232<br/>domain_id (24)<br/>trust domain"] --- NS["231-208<br/>namespace_id (24)<br/>tenant / subvolume"]
+    NS --- V["207-176<br/>volume_id (32)<br/>container / replica set"]
+    V --- G["175-144<br/>region (32)<br/>stripe / band / zone-set"]
+    G --- M["143-112<br/>device (32)<br/>4.29 G members max"]
+    M --- L["111-64<br/>device_lba (48)<br/>4 KiB units, 1 EiB per device"]
+    L --- O["63-0<br/>byte_offset (64)<br/>PMEM / CXL granularity"]
+```
+
+The widths account for every bit of the plane:
+
+$$24 + 24 + 32 + 32 + 32 + 48 + 64 = 256$$
+
 ## The embedding
 
 A compact address is a *prefix* of its wide image: `From<VolumeAddr>`
@@ -39,6 +55,22 @@ let c = VolumeAddr::compose(9, 100, 200, 1 << 40)?;
 let w: WideAddr = c.into();          // wide-only fields zero
 assert_eq!(w.try_compact(), Some(c)); // lossless
 ```
+
+```mermaid
+flowchart TB
+    C["VolumeAddr (Compact, 128-bit)"] -->|"From: total, always"| W["WideAddr (256-bit)<br/>wide-only fields zero"]
+    W --> T{"try_compact()"}
+    T -->|"domain_id = 0, namespace_id = 0,<br/>byte_offset = 0"| S["Some(compact): lossless round-trip"]
+    T -->|"any wide-only field nonzero"| N["None: the address stays wide"]
+```
+
+The embedding contract as a predicate:
+
+$$\mathrm{try\_compact}(w) = \mathrm{Some} \iff \mathrm{domain}_w = \mathrm{namespace}_w = \mathrm{offset}_w = 0$$
+
+and the per-device ceiling behind the capacity table:
+
+$$2^{48}\ \text{blocks} \times 2^{12}\ \mathrm{B} = 2^{60}\ \mathrm{B} = 1\ \mathrm{EiB}, \qquad 2^{32} = 4.29\ \mathrm{G\ devices}$$
 
 ## Field validation
 

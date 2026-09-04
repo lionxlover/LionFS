@@ -50,6 +50,12 @@ the port becomes a semantic fork, and the fork drifts.
    the *closest documented equivalent* and says so in its docs — or
    fails. It never silently downgrades durability.
 
+Rule 1 as a predicate — the portability contract this RFC answers to:
+
+$$\forall\, o \in \mathcal{O},\ \forall\, p_1, p_2 \in \mathcal{P}: \quad \mathrm{obs}(o, p_1) = \mathrm{obs}(o, p_2)$$
+
+where $\mathrm{obs}$ covers errno mapping, durability contract, and crash-recovery invariant; any divergence is a PAL bug by rule 1's definition.
+
 ## 3. The platform abstraction layer (`src/pal/`)
 
 | Module | Abstracts | Backends |
@@ -62,11 +68,41 @@ the port becomes a semantic fork, and the fork drifts.
 | `random` | OS CSPRNG | `getrandom` (glibc/musl) / `getentropy` (macOS, BSD) / `ProcessPrng`→`RtlGenRandom` (Windows) |
 | `waker` | cross-thread wakeup | `eventfd` (Linux); self-pipe (macOS/BSD); condvar+generation (Windows) |
 
+The PAL as the single OS surface — one portable core above three backend sets:
+
+```mermaid
+flowchart TB
+    CORE["LionFS core<br/>impl vfs::VfsOps, portable Rust"]
+    subgraph PALS["src/pal — the only OS surface (7 modules)"]
+        PLAT["platform: identity, page size, capability probe"]
+        FILEM["file: positioned reads and writes"]
+        SYNCM["sync: durability flavors"]
+        POSXM["posix: errno and S_IF mode bits"]
+        GEOMM["geometry: device geometry"]
+        RANDM["random: OS CSPRNG"]
+        WAKEM["waker: cross-thread wakeup"]
+    end
+    CORE --> PALS
+    PALS --> LIN["Linux backends<br/>read_at, fdatasync, BLK ioctls, getrandom, eventfd"]
+    PALS --> MAC["macOS backends<br/>read_at, F_FULLFSYNC, DKIOC ioctls, getentropy, self-pipe"]
+    PALS --> WIN["Windows backends<br/>seek_read, FlushFileBuffers, IOCTL_DISK, ProcessPrng, condvar"]
+```
+
 Durability deserves the emphasis: on APFS, plain `fsync` does **not**
 guarantee persistence to the SSD — only `F_FULLFSYNC` does — so the
 macOS `sync_data` is the expensive-but-real barrier. The intent
 journal's crash-consistency model (RFC-002 §5.1) is only valid because
 the PAL makes this trade per platform *visibly*.
+
+The crash-consistency ordering of RFC-002 §5.1 holds on every platform because the PAL barrier is the platform's real one:
+
+$$\mathrm{intent} \prec \mathrm{barrier}_{\mathrm{PAL}} \prec \mathrm{data} \prec \mathrm{commit}, \qquad \mathrm{barrier}_{\mathrm{PAL}} \in \{\texttt{fdatasync},\ \texttt{F\_FULLFSYNC},\ \texttt{FlushFileBuffers}\}$$
+
+and the backend coverage of the seven PAL modules as a fraction — $b_m$ implemented backend slots against $B_m$ specified:
+
+$$C_{\mathrm{PAL}} = \frac{1}{|\mathcal{M}|} \sum_{m \in \mathcal{M}} \frac{b_m}{B_m} = 1 \ \text{in the current tree}$$
+
+The pending fast paths (WinFsp bridge, IOCP, kqueue) sit above the PAL in the `vfs` and engine layers and do not change $C_{\mathrm{PAL}}$.
 
 ## 4. I/O engine per platform (extends RFC-002 Pillar I)
 
@@ -83,6 +119,23 @@ the PAL makes this trade per platform *visibly*.
   IOCP completion-port shape (one deque thread, `GetQueuedCompletionStatus`
   replacing `submit_and_wait`). Deliberately not rushed: the threaded
   floor must soak on Windows first (rule 3).
+
+Engine selection and degradation to the floor — rule 3's three moments (build time, setup time, op time):
+
+```mermaid
+flowchart TB
+    START["engine construction at mount"] --> FEAT{"io_uring feature compiled in?"}
+    FEAT -->|"no"| FLOOR["threaded engine — the correctness floor"]
+    FEAT -->|"yes"| PROBE{"io_uring_setup and probe accepted by the kernel?"}
+    PROBE -->|"refused: old kernel or seccomp"| FALL["degrade to the threaded engine,<br/>reason logged, mount proceeds"]
+    PROBE -->|"accepted"| URING["UringEngine: registered files,<br/>batched io_uring_enter"]
+    URING --> SEM["identical VfsOps semantics and<br/>completion shapes above either backend"]
+    FLOOR --> SEM
+    FALL --> SEM
+    URING --> OPR{"ring failure at op time?"}
+    OPR -->|"yes"| FALL
+    OPR -->|"no"| SEM
+```
 
 ## 5. The VFS bridge architecture
 
@@ -117,6 +170,35 @@ DELETE_ON_CLOSE, `Rename`→`rename`, `Flush`→`fsync`. The errno map is
 already in place (`pal::posix::io_error_to_errno` handles the Win32
 error-code direction). The bridge is a new file at the `vfs` boundary —
 the core does not change. That is the entire point of the shape.
+
+One request through either bridge — the FUSE and WinFsp shapes of the same VfsOps call:
+
+```mermaid
+sequenceDiagram
+    participant App as application
+    participant OS as kernel FUSE or WinFsp
+    participant BR as vfs bridge
+    participant Core as VfsOps core
+    participant PAL as PAL backend
+    App->>OS: read(fd, buf, len)
+    OS->>BR: FUSE READ request or WinFsp Read callback
+    BR->>Core: vfs.read(ino, offset, len)
+    Core->>Core: extent resolve, checksum policy
+    Core->>PAL: positioned read at device offset
+    PAL-->>Core: bytes and io_result
+    Core-->>BR: Ok(bytes) or Err(io::Error)
+    BR->>BR: translate io_error to errno via pal posix
+    BR-->>OS: reply with errno-equivalent status
+    OS-->>App: return len bytes
+```
+
+The bridge cost model — the 1.x entry cost stays visible while the translation itself remains pure userspace work:
+
+$$t_{\mathrm{op}}^{\mathrm{FUSE}} = 2\,t_{\mathrm{ctx}} + 2\,t_{\mathrm{copy}}(S) + t_{\mathrm{core}}, \qquad t_{\mathrm{copy}}(S) = \frac{S}{\mathrm{BW}_{\mathrm{mem}}}$$
+
+$$t_{\mathrm{bridge}} = t_{\mathrm{unmarshal}} + t_{\mathrm{errno}} = O(1)\ \text{CPU work, no syscalls}$$
+
+On Linux the io_uring front door of RFC-002 §3.1 removes the $t_{\mathrm{ctx}}$ and $t_{\mathrm{copy}}$ terms; on macOS and Windows they remain until the kqueue and IOCP backends land, and the threaded floor pays them on every platform.
 
 ## 6. Cargo topology
 
@@ -154,6 +236,12 @@ portable everywhere; Linux users opt into the ring with
   `--no-default-features`-style run (threaded only) and a feature run
   (io_uring) so the fallback path stays exercised, not vestigial.
 
+The parity contract as a divergence count over the shared op sequence $\mathcal{S}$:
+
+$$d_{\mathrm{parity}} = \sum_{o \in \mathcal{S}} \mathbf{1}\!\left[\mathrm{cplt}_{\mathrm{fast}}(o) \neq \mathrm{cplt}_{\mathrm{floor}}(o)\right] = 0$$
+
+— including EOF-as-error and zone-append placed offsets, wherever the fast backend runs.
+
 ## 8. Trade-offs, stated
 
 | Tension | Decision | Residual risk |
@@ -163,6 +251,12 @@ portable everywhere; Linux users opt into the ring with
 | Windows zero-crate rule | Raw FFI in the PAL | FFI surface must be reviewed like unsafe code (SAFETY comments are mandatory) |
 | io_uring opt-in vs. default-on | Opt-in (shared-host kernel politics: containers, seccomp, CVE-adjacent restrictions) | Users must pass `--features io_uring` to get the fast path |
 | Seek-based positioned I/O on Windows | Per-handle single-issuer discipline (engine shards own handles) | The discipline is documented; violating it is a bug, not a surprise |
+
+The macOS flush trade, priced as a throughput ratio:
+
+$$\frac{\mathrm{IOPS}_{\mathrm{fsync}}^{\mathrm{macOS}}}{\mathrm{IOPS}_{\mathrm{fsync}}^{\mathrm{Linux}}} = \frac{t_{\mathrm{data}} + t_{\mathrm{fdatasync}}}{t_{\mathrm{data}} + t_{\mathrm{F\_FULLFSYNC}}} \le 1$$
+
+Group commit divides the barrier term by the batch size on both platforms (RFC-002 §9.4), so the residual gap is the flush-cost difference itself — measured, not hidden.
 
 ## 9. Deliverables checklist
 

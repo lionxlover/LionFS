@@ -82,3 +82,62 @@ counted (`copy_in`/`copy_out`) and visible in the health summary.
 Numbers are userspace engine cost against tmpfs-backed images (the
 1.x `lfs_ioperf` discipline): reproducible via
 `lfs_engine <block> <qdepth> <rounds>`.
+
+## Submission pipeline (diagram)
+
+```mermaid
+flowchart LR
+    IN["MPMC inbox (Vyukov, bounded)"]
+    subgraph shards["Per-core shards (splitmix64 routing, up to 128)"]
+        S1["shard thread 1"] --> IN
+        SN["shard thread n"] --> IN
+    end
+    IN -->|"push + eventfd wake"| OWN["ring owner thread<br/>(single owner of the IoUring)"]
+    OWN -->|"translate_op, build SQEs"| SQ["SQ ring"]
+    SQ -->|"one io_uring_enter,<br/>then submit_and_wait(1)"| K["kernel"]
+    K --> CQ["CQ ring"]
+    CQ --> OWN
+    OWN -->|"reap CQEs (kernel_pending is exact)"| OUT["MPMC outbox"]
+    OUT --> DISP["dispatcher (per shard)"]
+    DISP --> COMP["Completion: zone-append placed offset,<br/>FUA durable, zero-byte read is EIO"]
+```
+
+The threaded backend is the same graph with worker threads in place of
+the ring owner; completion semantics are identical by construction.
+
+## Group commit (diagram)
+
+```mermaid
+sequenceDiagram
+    participant W as writers
+    participant B as GroupCommitBatcher
+    participant J as journal
+    participant D as device
+    W->>B: join batch (fsync)
+    B->>B: window closes at 5 ms or 1 MiB
+    B->>J: append intents
+    B->>D: data writes (FUA)
+    B->>D: commit record (durability point)
+    B-->>W: one BatchOutcome per member
+    Note over B,D: crash before the commit record rolls back every member
+```
+
+## Batch amortization and Little's law
+
+For $n$ ops of mean payload $\bar p$ against sequential bandwidth $B$,
+with fixed per-submission cost $c$ (enter, wakeup, completion
+bookkeeping):
+
+$$T(n) = \frac{n\bar p}{B} + c, \qquad
+T_{\text{op}}(n) = \frac{\bar p}{B} + \frac{c}{n}$$
+
+The $c/n$ term is why batches are arrays of POD descriptors and why
+the ring owner enters the kernel once per batch. At the measured
+io_uring 4 KiB read rate (1,627 MiB/s), the arrival rate is
+
+$$\lambda = \frac{1627\ \mathrm{MiB/s}}{4\ \mathrm{KiB}} \approx
+4.2 \times 10^{5}\ \mathrm{ops/s}$$
+
+and Little's law, $L = \lambda W$, converts the dispatcher's in-flight
+counter $L$ into mean completion latency $W$ — the health-bus latency
+series is this identity with the histogram in place of the mean.

@@ -72,3 +72,49 @@ small write ──► append (CRC'd)
   healer".
 - `replay_stream` (any `Read`) and `replay` (buffer) must agree
   bit-for-bit (tested).
+
+## Replay path (diagram)
+
+```mermaid
+sequenceDiagram
+    participant M as mount
+    participant L as log image
+    participant O as read overlay
+    participant T as B-epsilon tree
+    participant S as superblock
+    M->>L: read record
+    L->>M: header, payload, CRC32
+    alt full header, bad magic or version or type
+        M->>M: Corrupt, stop and surface to the healer
+    else short read, or CRC fails on a complete-length record
+        M->>M: Torn, stop and discard the tail silently
+    else valid
+        M->>O: apply in sequence order (Create, Data, Delete, Truncate)
+        Note over M,O: Commit closes a window, Checkpoint carries the watermark
+    end
+    M->>T: checkpoint drain in global sequence order
+    M->>S: record the watermark, then physically truncate
+```
+
+Torn-vs-corrupt survives in `ReplayStats.tail`: mount-time reporting
+separates "normal crash" from "call the healer".
+
+## Window amortization
+
+$n$ records of mean payload $\bar p$ share one sequential device write
+and one flush per window, against scattered per-op cost $c$:
+
+$$T_{\text{window}} = \frac{n\bar p}{B} + c, \qquad
+T_{\text{scattered}} = \frac{n\bar p}{B} + nc, \qquad
+\Delta T = (n-1)\,c$$
+
+At $n = 64$ records and 20 µs NVMe per-op cost the win is 1.26 ms per
+window — the reason a small write costs one device op, not three.
+
+The 3.1 wiring ([wiring.md](wiring.md), `small_write.rs`) routes
+payloads $\le 4032$ B here with a single comparison, closes windows at
+the 1 MiB byte budget or 256 records (the engine adds the time side),
+serves reads from the overlay with fall-through to the tree, and drains
+checkpoints through the transaction layer in sequence order — the tree
+observes exactly the order a post-crash replay would apply, and
+`sim::crash` asserts the writer view and replay view converge.

@@ -4,6 +4,105 @@ All notable changes to the LionFS project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Release line at a glance
+
+```mermaid
+flowchart LR
+    P0["0.1.0 initial prototype"] --> X1["1.x line, folded into 2.0 (245 tests)"]
+    X1 --> V2["2.0.0 cross-platform architecture: PAL, io_uring, 128-bit addressing (462 tests)"]
+    V2 --> V3["3.0.0 unlimited: eleven subsystems over the substrate (638 tests)"]
+    V3 --> V31["3.1.0 wiring: seven seams on the live paths, crash simulator (713 tests)"]
+```
+
+Test-suite growth per release (all green, with and without `io_uring`
+where applicable):
+
+$$N: 245 \to 462 \to 638 \to 713$$
+
+— a cumulative factor of $713/245 \approx 2.9\times$ over the 1.x
+line, with per-release deltas
+
+$$\Delta_k = N_k - N_{k-1}: \quad \Delta_{2.0} = 217, \quad \Delta_{3.0} = 176, \quad \Delta_{3.1} = 75$$
+
+## [3.1.0] - The Phase 8 Wiring Release
+
+The 3.0 policy layers were consultative: they answered "what should
+happen?" while the engine did what it already did. 3.1 wires them in.
+Test suite: 638 → **713** (all green); the deterministic crash
+simulator proves every wiring decision is a pure function of
+(seed, op index).
+
+### Added — The wiring layer (`src/wiring/`)
+- **QoS into the shard dispatcher** (`qos_gate.rs`): the admission
+  seam (quota early-reject → dual token bucket; Realtime's guarantee
+  survives an empty bucket as a metered overrun, BestEffort/Bulk
+  delay), plus `GroupCommitPicker` -- WFQ virtual-finish ordering for
+  group commit's batch pick (weights 8:4:1, service ratio proven in
+  property tests).
+- **Record journal onto the small-write path** (`small_write.rs`):
+  route decision (≤4032 B → log), group-commit window policy, the
+  read overlay (read-your-write), checkpoint drain into the tree via
+  a caller-supplied sink, and post-crash overlay rebuild from
+  replay -- writer view and replay view provably converge.
+- **GC execution loop** (`gc_loop.rs`): census → plan → evacuate →
+  reclaim-event feedback; panic mode stays Bulk-class but drops the
+  rate limit; `run_to_health` terminates at the kick watermark, an
+  honest all-live refusal, or the round cap.
+- **Retention daemon + rebalance driver** (`retention_daemon.rs`):
+  GFS passes rate-limited by interval (caller-supplied time), failed
+  expirations retried next pass; rebalance rounds until
+  `is_balanced`, leaving devices drained first.
+- **Guardian + Prometheus onto the sockets** (`telemetry_bridge.rs`):
+  one object both sockets scrape -- 19 bounded metric series covering
+  Guardian advisories (per kind, with evidence gauges and the window
+  stall detector) plus every wiring layer's A/B counters;
+  deterministic scrapes, advisory stream for the telemetry socket.
+- **Key-envelope flow** (`key_flow.rs`): mkfs create / mount unlock
+  with a 3-attempt budget and lockout (online-guess throughput
+  0.18/s at 600k PBKDF2 iterations), passphrase rotation via rewrap
+  (master untouched, file keys stable), full audit trail.
+- **Migration onto the real tar stream** (`tar_stream.rs`): a ustar
+  parser (checksum-verified, GNU longname, prefix composition) →
+  `ImportSink` write path → manifest recorded per file → SHA-256
+  read-back verification. Hardlinks/PAX counted, not materialized.
+
+### Added — The deterministic crash simulator (`src/sim/`, ②)
+- `SimClock` + seeded `SimRng` (xorshift64*): same seed, same
+  universe, bit-for-bit, on every platform.
+- `CrashSimulator`: the full Phase 8 stack on the simulated clock
+  with seeded op mixes; power cuts injected at deterministic op
+  indexes and tear offsets; invariants asserted, not observed --
+  **prefix property** (replay = ledger prefix), **overlay
+  convergence** (writer view == rebuilt replay view), torn-tail
+  discipline, telemetry surviving the crash.
+- `sweep`: the exhaustive crash-point sweep (every op index is a test
+  case -- the FoundationDB discipline).
+- New tool `lfs_simulate` (`run` / `sweep` / `determinism` modes).
+
+The simulator's determinism contract, as a picture:
+
+```mermaid
+flowchart LR
+    SEED["64-bit seed"] --> RNG["SimRng (xorshift64*) on SimClock"]
+    RNG --> UNIV["Deterministic universe, bit-for-bit on every platform"]
+    UNIV --> OPS["Seeded op mix across the full Phase 8 stack"]
+    OPS --> CUT{"Power cut at op index i"}
+    CUT -->|"run, single i"| INV["Invariants asserted: prefix property, overlay convergence, torn-tail discipline"]
+    CUT -->|"sweep, every i"| INV
+    INV --> SAME["Same seed, same universe, every run"]
+```
+
+### Changed — Tuned defaults (③)
+- **GC watermarks**: kick 20% → **25%**, aggressive 8% → **10%**
+  (background band 12 → 15 points: panic mode becomes rare, not
+  nightly); wear penalty 5 → 8 bps/100 cycles; age half-life 7d →
+  5d; plan cap 8 → 12 segments.
+- **Retention budgets**: hourly 24 → **48** (two full days of
+  recovery points); yearly 3 → **7** (SOX-grade horizon).
+- **QoS weights**: per-class tuned profile (RT 16 GiB/s, BE 4 GiB/s,
+  bulk 1 GiB/s; bursts 1 GiB/256 MiB/64 MiB) with WFQ weights
+  **8:4:1** (RT:BE:bulk service ratio under saturation).
+
 ## [3.0.0] - The Unlimited Release (LFS-RFC-004)
 
 Eleven production-blocker subsystems from the 3.0 gap analysis, all

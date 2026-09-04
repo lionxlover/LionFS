@@ -80,3 +80,54 @@ Fairness properties (tested):
   escalation is never suppressed (see Guardian spec).
 - Integer-only math everywhere; the simulator and production share
   bit-for-bit behavior.
+
+## Admission and scheduling path (diagram)
+
+```mermaid
+flowchart TD
+    OP["submitted op"] --> Q{"namespace quota<br/>(allocation is the charging authority)"}
+    Q -->|"over hard limit, or soft past grace"| DENY["denied, bounded denial ring (1024)"]
+    Q -->|ok| TB{"dual token bucket<br/>try_charge for bytes and ops"}
+    TB -->|"Realtime, bucket empty"| ADM["admitted and counted as overrun<br/>(RT is metered, never blocked)"]
+    TB -->|"BE or bulk, bucket empty"| DELAY["delayed, retry after refill<br/>(deny-soft, never wedge)"]
+    TB -->|charged| SLOT["24 scheduler slots, level-major,<br/>array lookup in the shard dispatcher"]
+    ADM --> SLOT
+    SLOT --> PICK["group commit window assembly:<br/>WFQ pick by virtual finish time"]
+    DELAY -->|refill| TB
+```
+
+## Token bucket refill
+
+Lazy refill against the caller-supplied `now_ns`, so the simulator and
+production share bit-for-bit behavior:
+
+$$T(t) = \min\bigl(b,\ T(t_0) + r\,(t - t_0)\bigr), \qquad
+t_0 = \text{last refill time}$$
+
+with burst capacity $b$ and sustained rate $r$ (integer whole-seconds
+plus fractional-ns arithmetic, saturating). Failed charges consume
+nothing.
+
+## WFQ convergence and the tuned profile
+
+Finish times are computed once at first declaration and virtual time
+never regresses, so under sustained saturation the service split
+converges to the weight ratio:
+
+$$\text{finish}_i = v_{\text{now}} + \frac{c_i}{w_i}, \qquad
+\frac{S_i}{S_j} \to \frac{w_i}{w_j}$$
+
+Phase 8 ([wiring.md](wiring.md)) places the gate on the live shard path
+(`qos_gate.rs`: quota check, then dual bucket, roughly 30 ns) and the
+WFQ picker in group commit's window assembly. Tuned profile (3.1):
+
+$$\begin{aligned}
+r_{\text{RT}} &= 16\ \mathrm{GiB/s} & b_{\text{RT}} &= 1\ \mathrm{GiB} \\
+r_{\text{BE}} &= 4\ \mathrm{GiB/s} & b_{\text{BE}} &= 256\ \mathrm{MiB} \\
+r_{\text{bulk}} &= 1\ \mathrm{GiB/s} & b_{\text{bulk}} &= 64\ \mathrm{MiB}
+\end{aligned}$$
+
+with weights $w = (8, 4, 1)$: a bulk byte costs its queue $8 \times$
+the virtual time of a realtime byte, so RT:bulk service converges to
+8:1 regardless of arrival pattern; property tests pin
+$7.4 < S_0/S_2 < 8.6$ over 8,000 rounds.

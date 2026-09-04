@@ -51,3 +51,41 @@ data band, never a promise). `unattended_ok()` gates cron/CI.
 
 - Detection is separate from driver claims: unknown-but-mounted
   still streams; the kernel's claim is the fallback, not the table.
+
+## Import protocol (diagram)
+
+```mermaid
+sequenceDiagram
+    participant O as operator or CI
+    participant D as detect.rs
+    participant P as plan.rs
+    participant T as tar stream or per-file reader
+    participant L as LionFS POSIX write path
+    participant M as manifest.rs
+    O->>D: source image or mounted tree
+    D->>P: kind, from the 10-rule magic table
+    P->>O: ImportPlan - strategy, sign-off gate,<br/>size range 0.62x to 1.0x
+    O->>T: approved
+    T->>L: stream files through the ImportSink seam
+    L->>M: ledger row per file (path, size, SHA-256)
+    M->>M: verify, re-read destination and compare
+    M-->>O: per-path outcomes, is_complete
+```
+
+## Verification coverage
+
+The manifest is the contract; the migration is complete only when
+every row was checked and every check passed:
+
+$$\text{coverage} = \frac{|\text{checked}|}{|\text{entries}|}, \qquad
+\text{is\_complete} \iff \text{failures} = 0 \ \wedge\
+|\text{checked}| = |\text{entries}| \ \wedge\ |\text{entries}| > 0$$
+
+SHA-256 makes a false pass negligible at any migration scale — for $m$
+imported files the birthday bound is
+
+$$\Pr[\text{false digest match}] \le \binom{m}{2} \cdot 2^{-256}$$
+
+— and the four outcomes (`NotInManifest`, `Missing`, `SizeMismatch`,
+`DigestMismatch`) localize each failure to a side, so a partial
+migration is a repairable state, not a restart.
