@@ -59,7 +59,29 @@ pub struct Superblock {
     // encrypted blocks, on-disk length for compressed blocks). See
     // `security::block_cipher::BlockTransformTree`. 0 = not initialized.
     pub crypto_tree_root: u64,
-    pub padding2: [u8; BLOCK_SIZE - 312],
+    /// Phase 9 (metadata path-copy CoW): high-water mark of the global
+    /// node-write stamp counter, persisted at every commit that moved a
+    /// frozen-tree root so a remount restarts stamps ABOVE every
+    /// on-disk stamp and every persisted snapshot barrier. Carved from
+    /// the old `padding2` region: images written by older code have
+    /// zero here, which reads as "all existing nodes are older than
+    /// any snapshot" -- exactly the right conservative answer.
+    pub node_generation: u64,
+    /// 3.6 (Format Vault, FS_FEATURE_XATTR): root of the extended-
+    /// attribute / POSIX-ACL tree (node type 13), keyed by inode
+    /// number. Carved from the old `padding2` region: images written
+    /// by older code have zero here, which reads as "no xattrs exist"
+    /// -- exactly the spill_extent_root / node_generation precedent.
+    /// 0 = no xattr tree (mkfs leaves it 0 until the first setxattr
+    /// initializes it).
+    pub xattr_tree_root: u64,
+    /// 3.6 (Format Vault, FS_FEATURE_ENVELOPE_V2): block holding the
+    /// volume key envelope v2 blob (magic "LFSE", kdf_id / aead_id /
+    /// kem_id agility fields; see `security::kdf::EnvelopeV2`). Carved
+    /// from the old `padding2` region; 0 = no passphrase envelope on
+    /// this volume (mount proceeds without unlock).
+    pub key_envelope_block: u64,
+    pub padding2: [u8; BLOCK_SIZE - 336],
 }
 
 #[repr(C)]

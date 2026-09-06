@@ -36,4 +36,10 @@ impl InodeCache {
     pub fn remove(&self, ino: u64) {
         self.cache.invalidate(&ino);
     }
+
+    /// Alias mirroring the moka term (call sites in the Phase 10
+    /// parallel path use this name).
+    pub fn invalidate(&self, ino: u64) {
+        self.cache.invalidate(&ino);
+    }
 }

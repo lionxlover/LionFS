@@ -7,8 +7,9 @@ cross-platform operation** (Linux, macOS, Windows) from one code base.
 This README describes what the tree actually implements; it
 deliberately does not advertise features that aren't there.
 
-**Status: 3.1 pre-alpha, unverified on real hardware.** The engine
-compiles and its test suite (**713 tests**) is green on Linux (with
+**Status: 3.6 pre-alpha, unverified on real hardware.** The engine
+compiles and its test suite (**790 lib tests**; 794 with io_uring) is
+green on Linux (with
 and without io_uring); macOS/Windows are compile-clean by
 construction (the PAL carries all platform differences) and exercised
 in CI. Before trusting it with data: build it, run `cargo test`,
@@ -39,6 +40,19 @@ flowchart TB
     SIM["sim: deterministic crash simulator"] -.-> WIRE
 ```
 
+### What 3.2 added on the data path
+
+The three honest gaps in the 3.1 docs are closed: snapshots PIN data
+blocks (a refcount coverage tree) and the write path REDIRECTS instead
+of modifying pinned blocks — snapshot read views no longer mutate
+under live writes; deduplication is wired (BLAKE3 index +
+verify-on-share, `LFS_DEDUP=1`, off by default like ZFS); and
+`lfs_ioperf` reports measured p50/p99/p999 per-call latencies. The
+checksum-tree insert — the measured ~45% of write cost — now rides a
+B-tree fast-append cache (epoch-guarded, fail-safe), and the GF(256)
+parity path serves its multiplication tables from a process-wide
+64 KiB cached set instead of rebuilding them per call.
+
 How one write traverses the 3.1 wiring, end to end:
 
 ```mermaid
@@ -62,6 +76,34 @@ The GC loop runs the same CoW path as a Bulk-class background
 circuit; the retention and rebalance daemons tick on caller-supplied
 time; the telemetry bridge exports 19 bounded series built from every
 layer's A/B counters.
+
+### What 3.3 added: metadata path-copy CoW + measured SMP reads + the mounted-fio framework
+
+The Phase 9 flagship: **snapshots now freeze metadata by construction,
+not by brute force.** Every B-tree node write carries a monotone stamp;
+a snapshot records the stamp barrier; and the mutation paths
+**path-copy** any frozen-tree node (inode, dir-name, spill-extent,
+checksum) before touching it. Snapshot creation is O(1) in metadata
+(the 3.2 inode deep-copy is gone) and still O(extent runs) in data
+(measured: 0.14 ms for a 32 MiB file). What a snapshot reads is now
+frozen across all four tree types — including the checksum tree, so
+`lfs_snapshot verify` checks snapshot data against the snapshot's OWN
+frozen checksum view. Design record with the soundness argument and
+the honest limits (no per-extent birth stamps yet — that is a
+format-v3 change, not a code change): `specifications/phase9_metadata_cow.md`.
+
+Measured, in-process (the usual harness caveats, labeled everywhere):
+the write tax of a live snapshot is ~9% on the first rewrite pass
+(one-time path-copies) and ~6% steady-state (data redirects only);
+SMP read scaling is 1.26x at 2 jobs through the shared node cache
+(`lfs_smpbench`, interleaved baseline/parallel in one process). And
+`benchmarks/fio/` is the executable answer to the oldest gap — same
+fio jobs against ext4/XFS/Btrfs/ZFS/LionFS-FUSE on one device,
+medians, on your hardware; it ships zero numbers by design.
+
+`lfs_snapshot` itself is new as a REAL tool: create / delete / list /
+verify through the actual SnapshotManager and journal (the 3.2 binary
+was a placeholder that printed success without touching the device).
 
 ## The 2.0 architecture (LFS-RFC-002, implemented here)
 
@@ -221,7 +263,7 @@ The 3.0 additions:
 ```bash
 cargo build --release                # portable everywhere
 cargo build --release --features io_uring   # Linux fast path
-cargo test [--features io_uring]     # 638 tests
+cargo test [--features io_uring]     # 730 tests
 cargo bench                          # criterion: beepsilon, fastcdc, btree, allocator, io
 ```
 
@@ -258,3 +300,101 @@ run.
 - [specifications/](specifications/) — the on-disk and subsystem specs
 - [ROADMAP.md](ROADMAP.md) — P0-P6 phases and exit criteria
 - [PORTING.md](PORTING.md) — how to port to a new platform
+
+
+## 3.4 — Parallel write path (Phase 10)
+
+The operations surface is `&self`: one mount, N threads. Buffered
+writes land in a write-back intake page cache behind per-inode gates
+(the Linux page-cache / ZFS-DMU shape), metadata staging stays
+serialized behind one staging lock (every 3.3 single-writer invariant
+preserved by construction), and concurrent fsyncs coalesce into one
+journal run + sync set (group commit). A commit-window seqlock keeps
+lock-free readers from ever observing a half-applied tree. Measured on
+the 2-vCPU dev container through the real `VfsOps` surface:
+**buffered write intake 3036 -> 4292 MiB/s at 2 jobs (1.41x)**, durable
+writes flat ~510 MiB/s (staging-bound, honestly labeled), vfs reads
+1608 MiB/s aggregate (1.11x). The suite grew to 754 lib tests
+(11 new parallel-write money tests on real images: concurrent writers,
+same-file interleave, RMW, crash-window durability, destroy barrier),
+simulator determinism re-proven, 60-point crash sweep all invariants
+held. Design record: `specifications/phase10_write_concurrency.md`;
+measurements: `benches/results/3.4/` (includes the container fio
+reference legs from a source-built fio 3.36).
+
+## 3.5 — Pipelined transaction groups + O(1) snapshots (Phase 11)
+
+The commit pipeline splits: a **quiesce** (microseconds, under the
+staging lock) freezes a transaction group into a pending list, then the
+journal + syncs + apply + root-cell switch run WITHOUT the staging lock
+-- writers stage the next group and readers read while a group's I/O is
+in flight (the lost-update guard is the pending-overlay chain every
+context consults). fsync drives adaptively: no commit in flight ->
+self-drive (zero thread-handoff latency); overlapping one -> wait for
+its driver's next group (coalesced). A background committer thread
+drains non-fsync staging. Readers are lock-free in the common case (a
+seqlock + pending-count hint; no staging-lock probe). And snapshots on
+checksummed images (the mkfs default) are **O(1) total**: the per-block
+**birth generations** recorded in the checksum tree replace the
+3.2-3.4 pin walk -- redirect-on-write, truncate-retain, and
+delete-reclaim all derive protection from `birth <= barrier`.
+Measured (2-vCPU container, medians of 3, `benches/results/3.5/`):
+buffered intake 2982 -> 4123 MiB/s at 2 jobs (1.38x, intact); durable
+parity at 1 job (480 MiB/s -- zero handoff cost) with no 2-job
+degradation; snapshot creation **0.015 ms** (O(1) in live extent runs;
+200 runs -> 1 allocation in the money test); under-snapshot steady
+rewrite 961 MiB/s (5.7x the 3.3 run, ~15% tax). The money tests then
+earned their keep the hard way: a ~1-in-6 flake under suite load
+uncovered FIVE real bugs -- a pre-existing journal-wrap recovery tear,
+superblock-slot/data collisions, a fixture journal-region overlap, a
+false group-coverage durability hole, and out-of-order applies -- all
+fixed with regression tests or permanent tripwires (the full hunt
+record is in the design record). Final validation: **762 lib tests /
+766 io_uring** (plus ~100 suite iterations), clippy at baseline 38,
+simulator determinism re-proven. Design record:
+`specifications/phase11_txg_birth.md`; measurements:
+`benches/results/3.5/`.
+
+## 3.6 — POSIX completeness, self-heal, agility, and the Format Vault (Phase 12)
+
+The all-round release: one upgrade on every front, each grounded in
+what the tree actually implements.
+
+* **Extended attributes + POSIX ACLs** -- a per-inode XattrTree
+  (frozen under snapshots) of self-describing "LXAT" blocks; the full
+  xattr surface through VfsOps and FUSE; POSIX 1003.1e draft-17 ACLs
+  in the ext4 wire format with evaluation, chmod re-mapping, and
+  mkdir default-ACL inheritance in the same transaction.
+* **Reflink clones** -- `copy_file_range` on a whole-file request
+  shares physical blocks under refcount pinning (the dedup redirect
+  machinery makes both sides writable): Btrfs/APFS clone parity with
+  zero data copied. `lfs_clone` is now a real tool.
+* **The wired self-heal scrub** -- the 3.3-3.5 scrubber was a
+  placeholder that never read a block; 3.6 verifies every
+  checksum-tree record, reconstructs corrupted blocks from parity or
+  a verifying mirror (accepted ONLY if the reconstruction verifies
+  against the recorded checksum), and rewrites in place -- with the
+  money test proving a flipped bit on a live RAID5 pool goes from
+  refused read to healed bytes. Redundancy-free profiles quarantine
+  honestly.
+* **Crypto/format agility** -- the write-path checksum is policy
+  (`LFS_CSUM`), stored per record; the volume key envelope v2 (with
+  kdf/aead/KEM agility ids) lives on disk at last; the mount gate
+  enforces it.
+* **The Format Vault** -- ZFS-style feature flags (`fs_features`, the
+  version stays 2; 3.5 images keep mounting), the gate moved into the
+  core, an 11-check conformance battery (`lfs_conformance`) and a
+  conformance-gated offline `lfs_upgrade`. The battery caught two
+  real pre-existing bugs on day one (static `free_blocks`, slots
+  written past EOF). Normative: `docs/rfc/LFS-RFC-005-format-vault.md`.
+* **Snapshot send/recv** -- `lfs_replicate send|recv` serializes a
+  snapshot's frozen view into a portable LFSS stream (every block
+  verified against the snapshot's own frozen checksum view) and
+  replays it through the ordinary write path with per-file SHA-256 +
+  manifest verification.
+
+Fixed along the way (all pre-existing, caught by the new money
+tests): corruption read as silent zeros (now EIO), partial-tail-page
+flushes committing page-rounded sizes, static `free_blocks`, first-use
+tree roots lost on crash, slots written past EOF. Design records:
+`specifications/{xattrs_acl,phase12_reflink,phase12_self_heal,crypto_agility,format_vault,replication}.md`.

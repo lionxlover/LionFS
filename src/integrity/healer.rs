@@ -162,6 +162,135 @@ pub enum RepairOutcome {
     LossReported,
 }
 
+// -- 3.6: the executor -------------------------------------------------------
+//
+// The 2.0-3.5 planner above stayed plan-only; 3.6 executes. The repair
+// strategy is deliberately IN-PLACE (the ZFS scrub posture at the vdev
+// level): the reconstruction is verified against the block's own
+// checksum BEFORE it is written, and the write is idempotent (a torn
+// repair leaves the block corrupt, which the next sweep heals again).
+// The checksum tree's `physical_block` pointer therefore does not
+// move, no extent remap is needed, and the only journal traffic is the
+// verification-status / bad-block-ledger bookkeeping the caller does.
+//
+// Single-block corruption heals from P alone (P is the XOR of the
+// data columns, so P + surviving data reconstructs one lost column at
+// any sub-chunk offset). Double corruption (P+Q) remains the documented
+// 3.6 limit; the RS(n,k) machinery (`pool::erasure`) is the future path.
+
+use std::io::{Error, ErrorKind};
+
+use crate::pool::raid::{RaidProfile, StripeLayout};
+
+/// How a verified reconstruction was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealSource {
+    /// Rebuilt from parity + surviving data columns (RAID5/6).
+    Parity,
+    /// Copied from a mirror replica whose bytes verify (RAID1/10).
+    Mirror { good_device: u32 },
+}
+
+/// Attempt to reconstruct the 4 KiB block at volume LBA `lba` and
+/// WRITE IT BACK to every device whose copy does not verify.
+///
+/// `expected` is the block's checksum from the checksum tree; `algo`
+/// is that record's algorithm. The reconstruction is accepted only if
+/// it verifies against `expected` -- the checksum is the arbiter, so
+/// a stale/wrong parity cannot "repair" a block into different wrong
+/// data.
+///
+/// Returns the source on success. `Err` = nothing verified (parity
+/// stale, all mirrors bad, or no redundancy): the caller quarantines.
+pub fn heal_block_in_place(
+    disk: &crate::disk::block_io::Disk,
+    lba: u64,
+    expected: &[u8; 32],
+    algo: crate::integrity::algorithms::ChecksumAlgorithm,
+) -> std::io::Result<HealSource> {
+    use crate::pool::raid as raid;
+    let block_len = crate::ondisk::serialization::BLOCK_SIZE;
+    let layout: StripeLayout = disk.raid_engine.layout(lba);
+    let profile = disk.raid_engine.profile;
+    let mut buf = [0u8; crate::ondisk::serialization::BLOCK_SIZE];
+
+    let verified = |b: &[u8]| crate::integrity::algorithms::verify_checksum(algo, b, expected);
+
+    match profile {
+        RaidProfile::Raid1 | RaidProfile::Raid10 => {
+            // Find a mirror replica that verifies...
+            let mut good: Option<(usize, [u8; crate::ondisk::serialization::BLOCK_SIZE])> = None;
+            for &dev in &layout.data_devs {
+                let mut b = [0u8; crate::ondisk::serialization::BLOCK_SIZE];
+                if disk.read_block_direct(dev, layout.phys_block, &mut b).is_ok() && verified(&b) {
+                    good = Some((dev, b));
+                    break;
+                }
+            }
+            let Some((good_dev, good_buf)) = good else {
+                return Err(Error::new(ErrorKind::InvalidData, "no verifying mirror"));
+            };
+            // ...rewrite every replica that does not.
+            for &dev in &layout.data_devs {
+                if dev == good_dev {
+                    continue;
+                }
+                let mut b = [0u8; crate::ondisk::serialization::BLOCK_SIZE];
+                let bad = disk
+                    .read_block_direct(dev, layout.phys_block, &mut b)
+                    .is_err()
+                    || !verified(&b);
+                if bad {
+                    disk.write_block_direct(dev, layout.phys_block, &good_buf)?;
+                }
+            }
+            Ok(HealSource::Mirror { good_device: good_dev as u32 })
+        }
+        RaidProfile::Raid5 | RaidProfile::Raid6 => {
+            // P = XOR of the data columns at the SAME phys offset, so a
+            // single corrupted column rebuilds from parity + the others
+            // at exactly the 4 KiB granularity the checksum covers.
+            let parity_dev = layout.parity_devs[0];
+            let mut p = [0u8; crate::ondisk::serialization::BLOCK_SIZE];
+            disk.read_block_direct(parity_dev, layout.phys_block, &mut p)?;
+
+            let mut surviving: Vec<Vec<u8>> = Vec::with_capacity(layout.other_data.len());
+            for &(dev, _col) in &layout.other_data {
+                let mut b = vec![0u8; block_len];
+                disk.read_block_direct(dev, layout.phys_block, &mut b)?;
+                surviving.push(b);
+            }
+            let refs: Vec<&[u8]> = surviving.iter().map(|v| v.as_slice()).collect();
+            let rebuilt = raid::rebuild_single_from_parity(&p, &refs, block_len);
+            if !verified(&rebuilt[..block_len]) {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "parity reconstruction failed verification",
+                ));
+            }
+            buf[..block_len].copy_from_slice(&rebuilt[..block_len]);
+            // Write back ONLY the devices whose copy does not verify
+            // (the target -- and any other device that happens to be
+            // silently bad at this offset).
+            for &dev in &layout.data_devs {
+                let mut b = [0u8; crate::ondisk::serialization::BLOCK_SIZE];
+                let bad = disk
+                    .read_block_direct(dev, layout.phys_block, &mut b)
+                    .is_err()
+                    || !verified(&b);
+                if bad {
+                    disk.write_block_direct(dev, layout.phys_block, &buf)?;
+                }
+            }
+            Ok(HealSource::Parity)
+        }
+        RaidProfile::Single | RaidProfile::Raid0 => Err(Error::new(
+            ErrorKind::Unsupported,
+            "no redundancy on this profile: corruption is unrecoverable",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

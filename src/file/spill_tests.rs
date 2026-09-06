@@ -76,7 +76,8 @@ fn build_image(
         raid_profile: 0,
         padding_raid: [0; 3],
         chunk_size: 0,
-        padding2: [0; 3784],
+        padding2: [0; 3760], xattr_tree_root: 0, key_envelope_block: 0,
+            node_generation: 0,
     };
     disk.write_block(0, bytemuck::bytes_of(&sb)).unwrap();
 
@@ -138,7 +139,7 @@ fn large_sequential_write_spills_and_reads_back() {
 
     let mut inode = new_inode(2);
     let payload: Vec<u8> = (0..400u32).flat_map(|i| (i * 977).to_le_bytes()).collect();
-    FileManager::write_file(&mut ctx, &bg, 4096, 0, &cctx, &mut inode, 0, &payload).unwrap();
+    FileManager::write_file(&mut ctx, &bg, 4096, 0, 0, 0, &cctx, &mut inode, 0, &payload).unwrap();
 
     assert_eq!(inode.size, payload.len() as u64);
     // Sequential writes over a fresh region merge into a single extent
@@ -203,6 +204,8 @@ fn fragmented_writes_spill_and_survive() {
             &mut ctx,
             &bg,
             4096,
+            0,
+            0,
             0,
             &cctx,
             &mut inode,
@@ -270,6 +273,8 @@ fn truncate_frees_spilled_extents() {
             &bg,
             4096,
             0,
+            0,
+            0,
             &cctx,
             &mut inode,
             block * BLOCK_SIZE as u64,
@@ -284,7 +289,10 @@ fn truncate_frees_spilled_extents() {
     let written_blocks = 150u64; // 300 / 2
 
     let free_before = Allocator::count_free_blocks(&mut ctx, bg.bg_block_bitmap, 4096).unwrap();
-    FileManager::truncate_file(&mut ctx, &bg, 4096, &mut inode, 40 * BLOCK_SIZE as u64).unwrap();
+    FileManager::truncate_file(
+        &mut ctx, &bg, 4096, 0, 0, &mut inode, 40 * BLOCK_SIZE as u64,
+    )
+    .unwrap();
     let free_after = Allocator::count_free_blocks(&mut ctx, bg.bg_block_bitmap, 4096).unwrap();
     assert_eq!(inode.size, 40 * BLOCK_SIZE as u64);
 
@@ -341,7 +349,7 @@ fn readahead_lru_serves_correct_data_and_invalidates_on_write() {
     let payload: Vec<u8> = (0..64u32)
         .flat_map(|i| (i * 5417u32).to_le_bytes())
         .collect();
-    FileManager::write_file(&mut ctx, &bg, 4096, 0, &cctx, &mut inode, 0, &payload).unwrap();
+    FileManager::write_file(&mut ctx, &bg, 4096, 0, 0, 0, &cctx, &mut inode, 0, &payload).unwrap();
 
     // First read warms the LRU; second read must serve identical bytes
     // (whether from LRU or tx -- correctness is what matters).
@@ -353,7 +361,7 @@ fn readahead_lru_serves_correct_data_and_invalidates_on_write() {
     // Overwrite the first block and re-read: the write must invalidate
     // the stale cached copy.
     let new_payload = vec![0xEEu8; 256];
-    FileManager::write_file(&mut ctx, &bg, 4096, 0, &cctx, &mut inode, 0, &new_payload).unwrap();
+    FileManager::write_file(&mut ctx, &bg, 4096, 0, 0, 0, &cctx, &mut inode, 0, &new_payload).unwrap();
     let c = FileManager::read_file(&mut ctx, 0, 0, &cctx, &mut inode, 0, 256).unwrap();
     assert!(
         c.iter().all(|&x| x == 0xEE),

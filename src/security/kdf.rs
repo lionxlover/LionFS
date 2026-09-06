@@ -276,6 +276,196 @@ fn derive_kek(passphrase: &[u8], salt: &[u8; SALT_LEN], iterations: u32) -> Resu
     Ok(kek)
 }
 
+// ---------------------------------------------------------------------------
+// 3.6: Envelope v2 -- the on-disk, algorithm-agile envelope
+// ---------------------------------------------------------------------------
+
+/// v2 envelope magic ("LFSE", little-endian).
+pub const ENVELOPE_V2_MAGIC: u32 = 0x4553_464C;
+/// Fixed v2 wire size (one self-describing record; stored at
+/// `Superblock::key_envelope_block`).
+pub const ENVELOPE_V2_SIZE: usize = 96;
+
+// KDF algorithm ids (the agility registry; new ids extend, never
+// re-mean).
+pub const KDF_PBKDF2_HMAC_SHA256: u8 = 1;
+// AEAD algorithm ids -- the same registry `Inode::encryption_algo`
+// already uses (constants::ENCRYPTION_*), so the key envelope and the
+// per-block ciphers share one id space.
+pub const AEAD_NONE: u8 = 0;
+
+/// The post-quantum key-encapsulation slot: 0 = none (passphrase-only
+/// wrap). A future ML-KEM hybrid writes a KEM id here plus a
+/// KEM-wrapped share into the reserved tail; the passphrase wrap
+/// remains the recovery factor. The slot is FORMAT, not code: a
+/// 3.6-era image can gain PQ protection by rewrap without reformat.
+pub const KEM_NONE: u16 = 0;
+
+/// The v2 envelope: everything needed to unwrap the master given the
+/// passphrase, PLUS the algorithm registry that makes the format
+/// upgradable without reformatting (the 200-year requirement).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvelopeV2 {
+    /// KDF id (`KDF_*`).
+    pub kdf_id: u8,
+    /// AEAD id (the `ENCRYPTION_*` registry).
+    pub aead_id: u8,
+    /// KEM id (`KEM_*`; reserved slot for post-quantum hybrids).
+    pub kem_id: u16,
+    pub iterations: u32,
+    pub salt: [u8; SALT_LEN],
+    pub nonce: [u8; NONCE_LEN],
+    /// ciphertext+tag of the 32-byte master under the derived KEK.
+    pub wrapped: [u8; KEY_LEN + TAG_LEN],
+}
+
+impl EnvelopeV2 {
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; ENVELOPE_V2_SIZE] {
+        let mut out = [0u8; ENVELOPE_V2_SIZE];
+        out[0..4].copy_from_slice(&ENVELOPE_V2_MAGIC.to_le_bytes());
+        out[4..6].copy_from_slice(&2u16.to_le_bytes());
+        out[6] = self.kdf_id;
+        out[7] = self.aead_id;
+        out[8..10].copy_from_slice(&self.kem_id.to_le_bytes());
+        // 10..12 reserved
+        out[12..16].copy_from_slice(&self.iterations.to_le_bytes());
+        out[16..32].copy_from_slice(&self.salt);
+        out[32..44].copy_from_slice(&self.nonce);
+        out[44..92].copy_from_slice(&self.wrapped);
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < ENVELOPE_V2_SIZE {
+            return Err(Error::new(ErrorKind::InvalidData, "envelope v2 truncated"));
+        }
+        let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if magic != ENVELOPE_V2_MAGIC {
+            return Err(Error::new(ErrorKind::InvalidData, "not an LFSE envelope"));
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != 2 {
+            return Err(Error::new(ErrorKind::InvalidData, "unknown envelope version"));
+        }
+        let mut salt = [0u8; SALT_LEN];
+        salt.copy_from_slice(&bytes[16..32]);
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(&bytes[32..44]);
+        let mut wrapped = [0u8; KEY_LEN + TAG_LEN];
+        wrapped.copy_from_slice(&bytes[44..92]);
+        Ok(Self {
+            kdf_id: bytes[6],
+            aead_id: bytes[7],
+            kem_id: u16::from_le_bytes([bytes[8], bytes[9]]),
+            iterations: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+            salt,
+            nonce,
+            wrapped,
+        })
+    }
+
+    /// Wrap a fresh master under `passphrase` with the given
+    /// algorithms (the mkfs-time constructor).
+    pub fn create(passphrase: &[u8], kdf_id: u8, aead_id: u8, iterations: u32) -> Result<(Self, KeyEnvelope)> {
+        match kdf_id {
+            KDF_PBKDF2_HMAC_SHA256 => {}
+            other => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("unsupported envelope KDF id {other}"),
+                ))
+            }
+        }
+        if crate::security::encryption::EncryptionManager::get_algorithm(aead_id).is_none() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("unsupported envelope AEAD id {aead_id}"),
+            ));
+        }
+        let mut master = [0u8; KEY_LEN];
+        fill_random(&mut master)?;
+        let mut salt = [0u8; SALT_LEN];
+        fill_random(&mut salt)?;
+        let mut nonce = [0u8; NONCE_LEN];
+        fill_random(&mut nonce)?;
+        let kek = derive_kek(passphrase, &salt, iterations)?;
+        let wrapped = aead_seal_by_id(aead_id, &kek, &nonce, &master)?;
+        Ok((
+            Self { kdf_id, aead_id, kem_id: KEM_NONE, iterations, salt, nonce, wrapped },
+            KeyEnvelope { master: ZeroingKey::new(master) },
+        ))
+    }
+
+    /// Unwrap the master (the mount-time constructor).
+    pub fn unwrap(passphrase: &[u8], blob: &Self) -> Result<KeyEnvelope> {
+        match blob.kdf_id {
+            KDF_PBKDF2_HMAC_SHA256 => {}
+            other => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("unsupported envelope KDF id {other}"),
+                ))
+            }
+        }
+        let kek = derive_kek(passphrase, &blob.salt, blob.iterations)?;
+        let master = aead_open_by_id(blob.aead_id, &kek, &blob.nonce, &blob.wrapped)?;
+        Ok(KeyEnvelope { master: ZeroingKey::new(master) })
+    }
+}
+
+/// AEAD dispatch by registry id (agility seam: adding an algorithm
+/// means adding it to `EncryptionManager` -- the envelope needs no
+/// format change).
+fn aead_seal_by_id(id: u8, key: &[u8; 32], nonce: &[u8; NONCE_LEN], plaintext: &[u8]) -> Result<[u8; KEY_LEN + TAG_LEN]> {
+    if id == AEAD_NONE {
+        return Err(Error::new(ErrorKind::InvalidInput, "envelope requires an AEAD"));
+    }
+    let alg = crate::security::encryption::EncryptionManager::get_algorithm(id)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, format!("unknown AEAD id {id}")))?;
+    let ct = alg.encrypt(key, plaintext, nonce)?;
+    if ct.len() != KEY_LEN + TAG_LEN {
+        return Err(Error::new(ErrorKind::Other, "AEAD output length mismatch"));
+    }
+    let mut out = [0u8; KEY_LEN + TAG_LEN];
+    out.copy_from_slice(&ct);
+    Ok(out)
+}
+
+fn aead_open_by_id(
+    id: u8,
+    key: &[u8; 32],
+    nonce: &[u8; NONCE_LEN],
+    wrapped: &[u8; KEY_LEN + TAG_LEN],
+) -> Result<[u8; 32]> {
+    let alg = crate::security::encryption::EncryptionManager::get_algorithm(id)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, format!("unknown AEAD id {id}")))?;
+    let pt = alg
+        .decrypt(key, wrapped, nonce)
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "key unwrap failed: wrong passphrase or corrupt envelope"))?;
+    if pt.len() != KEY_LEN {
+        return Err(Error::new(ErrorKind::InvalidData, "unwrapped master length mismatch"));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&pt);
+    Ok(out)
+}
+
+/// Decode the envelope stored at `Superblock::key_envelope_block`
+/// (one 4096-byte block; the v2 record occupies the first 96 bytes).
+pub fn envelope_from_block(block: &[u8]) -> Result<EnvelopeV2> {
+    EnvelopeV2::from_bytes(block)
+}
+
+/// Encode the envelope into its on-disk block.
+#[must_use]
+pub fn envelope_to_block(blob: &EnvelopeV2) -> [u8; crate::ondisk::serialization::BLOCK_SIZE] {
+    let mut block = [0u8; crate::ondisk::serialization::BLOCK_SIZE];
+    let rec = blob.to_bytes();
+    block[..ENVELOPE_V2_SIZE].copy_from_slice(&rec);
+    block
+}
+
 /// Per-file key derivation, standalone (for the on-disk key tree).
 #[must_use]
 pub fn derive_file_key(master: &[u8; 32], file_id: u64) -> [u8; 32] {

@@ -45,6 +45,14 @@ impl ChecksumTree {
         }
     }
 
+    /// Phase 9: handle over a SNAPSHOT's recorded (frozen) root --
+    /// reads the recorded past, never following the live root mirror.
+    pub fn new_frozen(root_block: u64) -> Self {
+        Self {
+            btree: BTree::new_frozen(root_block, CHECKSUM_TREE_NODE_TYPE),
+        }
+    }
+
     pub fn init_empty(ctx: &mut TxContext, root_block: u64) -> Result<()> {
         BTree::<ChecksumTreeKey, ChecksumTreeValue>::init_empty(
             ctx,

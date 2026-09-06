@@ -1,0 +1,10 @@
+[
+  {"pattern": "seq4k-write-fresh", "mib_per_s": 692.10, "ops_per_s": 177176, "bytes": 33554432, "secs": 0.046, "extents": 7, "spill_entries": 1, "spilled": true, "checksums": true, "p50_us": 0.0, "p99_us": 0.0, "p999_us": 0.0},
+  {"pattern": "seq4k-write", "mib_per_s": 1327.14, "ops_per_s": 339748, "bytes": 13916090368, "secs": 10.000, "extents": 7, "spill_entries": 0, "spilled": true, "checksums": true, "p50_us": 2.6, "p99_us": 6.7, "p999_us": 14.1},
+  {"pattern": "seq4k-read", "mib_per_s": 2240.62, "ops_per_s": 573598, "bytes": 23494574080, "secs": 10.000, "extents": 7, "spill_entries": 0, "spilled": true, "checksums": true, "p50_us": 1.5, "p99_us": 4.9, "p999_us": 12.3},
+  {"pattern": "seq64k-write-fresh", "mib_per_s": 1151.29, "ops_per_s": 18421, "bytes": 33554432, "secs": 0.028, "extents": 7, "spill_entries": 1, "spilled": true, "checksums": true, "p50_us": 0.0, "p99_us": 0.0, "p999_us": 0.0},
+  {"pattern": "seq64k-write", "mib_per_s": 1440.15, "ops_per_s": 23042, "bytes": 15101067264, "secs": 10.000, "extents": 7, "spill_entries": 0, "spilled": true, "checksums": true, "p50_us": 42.7, "p99_us": 55.7, "p999_us": 88.9},
+  {"pattern": "seq64k-read", "mib_per_s": 2391.27, "ops_per_s": 38260, "bytes": 25074335744, "secs": 10.000, "extents": 7, "spill_entries": 0, "spilled": true, "checksums": true, "p50_us": 25.1, "p99_us": 38.0, "p999_us": 45.9},
+  {"pattern": "rand4k-read", "mib_per_s": 2022.74, "ops_per_s": 517822, "bytes": 21209976832, "secs": 10.000, "extents": 7, "spill_entries": 1, "spilled": true, "checksums": true, "p50_us": 1.7, "p99_us": 5.3, "p999_us": 14.9},
+  {"pattern": "rand4k-write", "mib_per_s": 1136.17, "ops_per_s": 290860, "bytes": 11913625600, "secs": 10.000, "extents": 7, "spill_entries": 8184, "spilled": true, "checksums": true, "p50_us": 3.1, "p99_us": 7.2, "p999_us": 17.3}
+]

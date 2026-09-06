@@ -129,6 +129,8 @@ impl DirManager {
                         bg_desc,
                         blocks_per_group,
                         checksum_tree_root,
+                        0, // no coverage tree: directory blocks are never snapshot-pinned (documented limitation)
+                        0, // dedup off for directory blocks (metadata, not dedupable content)
                         &cctx,
                         inode,
                         offset as u64,
@@ -155,6 +157,8 @@ impl DirManager {
                         bg_desc,
                         blocks_per_group,
                         checksum_tree_root,
+                        0, // no coverage tree: directory blocks are never snapshot-pinned (documented limitation)
+                        0, // dedup off for directory blocks (metadata, not dedupable content)
                         &cctx,
                         inode,
                         offset as u64,
@@ -179,6 +183,8 @@ impl DirManager {
                         bg_desc,
                         blocks_per_group,
                         checksum_tree_root,
+                        0, // no coverage tree: directory blocks are never snapshot-pinned (documented limitation)
+                        0, // dedup off for directory blocks (metadata, not dedupable content)
                         &cctx,
                         inode,
                         (offset + current_required as usize) as u64,
@@ -209,6 +215,8 @@ impl DirManager {
             bg_desc,
             blocks_per_group,
             checksum_tree_root,
+            0, // no coverage tree: directory blocks are never snapshot-pinned (documented limitation)
+            0, // dedup off for directory blocks (metadata, not dedupable content)
             &cctx,
             inode,
             inode.size,
@@ -267,6 +275,8 @@ impl DirManager {
                         bg_desc,
                         blocks_per_group,
                         checksum_tree_root,
+                        0, // no coverage tree: directory blocks are never snapshot-pinned (documented limitation)
+                        0, // dedup off for directory blocks (metadata, not dedupable content)
                         &cctx,
                         inode,
                         offset as u64,

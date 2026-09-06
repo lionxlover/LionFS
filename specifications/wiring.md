@@ -62,6 +62,16 @@ flowchart TB
     BR --> TS2["telemetry socket<br/>(advisory stream)"]
 ```
 
+## Not wiring seams, but on the live paths since 3.2
+
+The data-path CoW (refcount coverage pinning + redirect-on-write +
+pin-aware truncate) and the dedup probe (BLAKE3 index +
+verify-on-share) live directly in `file::writer::write_file` rather
+than behind a `src/wiring/` seam: they are data-path decisions, not
+policy consults. See [snapshots.md](snapshots.md) for the pin model
+and [dedup.md](dedup.md) for the probe contract. The QoS gate below
+remains the admission point that sits in FRONT of all of it.
+
 ## QoS admission + WFQ batch pick (`qos_gate.rs`)
 
 The shard gate composes two checks per submitted op: the namespace

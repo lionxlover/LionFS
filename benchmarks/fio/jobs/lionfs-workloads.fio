@@ -1,0 +1,91 @@
+[seq-write]
+description=Sequential 64 KiB writes (the LionFS harness's strongest workload)
+filename=fseq.bin
+rw=write
+bs=64k
+iodepth=16
+direct=1
+ioengine=psync
+size=1g
+runtime=30
+time_based=1
+group_reporting=1
+
+[seq-read]
+description=Sequential 64 KiB reads
+filename=fseq.bin
+rw=read
+bs=64k
+iodepth=16
+direct=1
+ioengine=psync
+size=1g
+runtime=30
+time_based=1
+group_reporting=1
+
+[rand-read]
+description=Random 4 KiB reads
+filename=fseq.bin
+rw=randread
+bs=4k
+iodepth=16
+direct=1
+ioengine=psync
+size=1g
+runtime=30
+time_based=1
+group_reporting=1
+
+[rand-write]
+description=Random 4 KiB writes
+filename=fseq.bin
+rw=randwrite
+bs=4k
+iodepth=16
+direct=1
+ioengine=psync
+size=1g
+runtime=30
+time_based=1
+group_reporting=1
+
+[mixed]
+description=70/30 read/write random mix
+filename=fseq.bin
+rw=randrw
+rwmixread=70
+bs=4k
+iodepth=16
+direct=1
+ioengine=psync
+size=1g
+runtime=30
+time_based=1
+group_reporting=1
+
+[create-delete]
+description=File create/unlink storm (metadata)
+filename=fc/
+rw=none
+nrfiles=2000
+file_size=4k
+
+[create]
+description=Create phase of the metadata storm
+rw=write
+bs=4k
+filename=fc/file.:file_nr:
+nrfiles=2000
+file_size=4k
+direct=1
+ioengine=psync
+group_reporting=1
+
+[delete]
+description=Unlink phase of the metadata storm
+stonewall
+rw=del
+nrfiles=2000
+filename=fc/file.:file_nr:
+group_reporting=1

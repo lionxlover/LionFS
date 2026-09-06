@@ -121,7 +121,8 @@ fn build_env(
         raid_profile: 0,
         padding_raid: [0; 3],
         chunk_size: 0,
-        padding2: [0; 3784],
+        padding2: [0; 3760], xattr_tree_root: 0, key_envelope_block: 0,
+            node_generation: 0,
     };
     disk.write_block(0, bytemuck::bytes_of(&sb)).unwrap();
     let bg = BlockGroupDescriptor {
@@ -189,7 +190,7 @@ fn cluster_roundtrip_and_real_space_savings() {
     let corpus = mixed_corpus((CLUSTER_BYTES * 3) as usize);
 
     let before = blocks_used(&mut ctx, &bg, 16384);
-    FileManager::write_file(&mut ctx, &bg, 16384, 0, &cctx, &mut inode, 0, &corpus).unwrap();
+    FileManager::write_file(&mut ctx, &bg, 16384, 0, 0, 0, &cctx, &mut inode, 0, &corpus).unwrap();
     let after = blocks_used(&mut ctx, &bg, 16384);
     let consumed = after - before;
     let logical_blocks = (corpus.len() as u64).div_ceil(BLOCK_SIZE as u64);
@@ -259,7 +260,7 @@ fn incompressible_data_falls_back_to_raw() {
         .collect();
 
     let before = blocks_used(&mut ctx, &bg, 16384);
-    FileManager::write_file(&mut ctx, &bg, 16384, 0, &cctx, &mut inode, 0, &random_data).unwrap();
+    FileManager::write_file(&mut ctx, &bg, 16384, 0, 0, 0, &cctx, &mut inode, 0, &random_data).unwrap();
     let after = blocks_used(&mut ctx, &bg, 16384);
     let consumed = after - before;
     let logical_blocks = (random_data.len() as u64).div_ceil(BLOCK_SIZE as u64);
@@ -299,7 +300,7 @@ fn cluster_overwrite_and_truncate() {
 
     let mut inode = compressed_inode(4);
     let corpus = mixed_corpus((CLUSTER_BYTES * 3) as usize);
-    FileManager::write_file(&mut ctx, &bg, 16384, 0, &cctx, &mut inode, 0, &corpus).unwrap();
+    FileManager::write_file(&mut ctx, &bg, 16384, 0, 0, 0, &cctx, &mut inode, 0, &corpus).unwrap();
 
     // Overwrite the middle of cluster 1 (a cluster RMW).
     let patch: Vec<u8> = (0..8192).map(|i| (i % 7 + 1) as u8).collect();
@@ -307,6 +308,8 @@ fn cluster_overwrite_and_truncate() {
         &mut ctx,
         &bg,
         16384,
+        0,
+        0,
         0,
         &cctx,
         &mut inode,
@@ -324,7 +327,7 @@ fn cluster_overwrite_and_truncate() {
     // partial one shorter.
     let new_size = CLUSTER_BYTES * 2 + 4096; // keep 2 full + 1 partial (4 KiB)
     let free_before = Allocator::count_free_blocks(&mut ctx, bg.bg_block_bitmap, 16384).unwrap();
-    FileManager::truncate_file(&mut ctx, &bg, 16384, &mut inode, new_size).unwrap();
+    FileManager::truncate_file(&mut ctx, &bg, 16384, 0, 0, &mut inode, new_size).unwrap();
     let free_after = Allocator::count_free_blocks(&mut ctx, bg.bg_block_bitmap, 16384).unwrap();
     assert_eq!(inode.size, new_size);
     assert!(
@@ -359,7 +362,7 @@ fn uncompressed_inode_unaffected_by_cluster_code() {
 
     let mut inode = plain_inode(5);
     let data = vec![0x77u8; 200 * BLOCK_SIZE];
-    FileManager::write_file(&mut ctx, &bg, 8192, 0, &cctx, &mut inode, 0, &data).unwrap();
+    FileManager::write_file(&mut ctx, &bg, 8192, 0, 0, 0, &cctx, &mut inode, 0, &data).unwrap();
     // Phase 1's speculative sizing means a sequential plain write
     // merges into ONE inline extent (no spill tree needed) -- the
     // important property here is that the cluster code did not hijack
@@ -392,7 +395,7 @@ fn cluster_tree_reports_physical_usage() {
 
     let mut inode = compressed_inode(6);
     let corpus = mixed_corpus((CLUSTER_BYTES * 2) as usize);
-    FileManager::write_file(&mut ctx, &bg, 16384, 0, &cctx, &mut inode, 0, &corpus).unwrap();
+    FileManager::write_file(&mut ctx, &bg, 16384, 0, 0, 0, &cctx, &mut inode, 0, &corpus).unwrap();
 
     let tree = ClusterTree::new(inode.spill_extent_root);
     let used = tree.total_physical_blocks(&mut ctx).unwrap();

@@ -55,11 +55,53 @@ fn main() {
     let sb: Superblock = *bytemuck::from_bytes(&sb_buf);
     drop(bootstrap);
 
-    // Refuse filesystems written by a NEWER format version (whose
-    // fields this build could silently misinterpret).
-    if !lionfs_core::common::version::is_safe_to_mount(sb.version) {
-        eprintln!("Refusing to mount: on-disk format version {} is newer than this build understands (supports {})", sb.version, lionfs_core::common::version::CURRENT_VERSION);
+    // Refuse filesystems this build cannot understand: a NEWER format
+    // version (whose fields this build could silently misinterpret)
+    // OR unknown fs_features bits (the 3.6 Format Vault gate; the
+    // core's LionFS::new enforces the same rule for library callers).
+    if !lionfs_core::common::version::is_mountable(sb.version, sb.fs_features) {
+        eprintln!(
+            "Refusing to mount: format version {} with feature bits {:#x} exceeds this build (version {}, known bits {:#x})",
+            sb.version,
+            sb.fs_features,
+            lionfs_core::common::version::CURRENT_VERSION,
+            lionfs_core::common::version::KNOWN_FS_FEATURES
+        );
         std::process::exit(1);
+    }
+
+    // 3.6: volume key envelope gate. An image with a passphrase
+    // envelope cannot unlock without it (3 attempts, the key_flow
+    // lockout budget).
+    if sb.key_envelope_block != 0 {
+        let pool_disk = Disk::open(image_file).expect("reopen for envelope");
+        let mut env_buf = [0u8; BLOCK_SIZE];
+        pool_disk
+            .read_block(sb.key_envelope_block, &mut env_buf)
+            .expect("read key envelope block");
+        drop(pool_disk);
+        match lionfs_core::security::kdf::envelope_from_block(&env_buf) {
+            Ok(blob) => {
+                let passphrase = std::env::var("LFS_PASSPHRASE").unwrap_or_default();
+                if passphrase.is_empty() {
+                    eprintln!(
+                        "This volume is passphrase-protected. Set LFS_PASSPHRASE (or mount from a terminal that provides it)."
+                    );
+                    std::process::exit(1);
+                }
+                if lionfs_core::security::kdf::EnvelopeV2::unwrap(passphrase.as_bytes(), &blob)
+                    .is_err()
+                {
+                    eprintln!("Passphrase rejected (envelope authentication failed).");
+                    std::process::exit(1);
+                }
+                println!("Volume unlocked (envelope v2: kdf={}, aead={}).", blob.kdf_id, blob.aead_id);
+            }
+            Err(e) => {
+                eprintln!("Refusing to mount: key envelope unreadable ({e}).");
+                std::process::exit(1);
+            }
+        }
     }
 
     let profile = RaidProfile::from_u8(sb.raid_profile);

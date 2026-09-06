@@ -1,0 +1,5 @@
+snapshot-tax: creation 0.138 ms (pin walk over 7 extent runs + O(1) metadata)
+lfs_ioperf --snapshot-tax (in-process; NOT fio-comparable)
+  snap-base-fresh            178.46 MiB/s       2855 ops/s  p50     0.0 us  p99      0.0 us  extents 7
+  snap-cow-first-pass        163.04 MiB/s       2609 ops/s  p50     0.0 us  p99      0.0 us  extents 7
+  snap-steady                168.64 MiB/s       2698 ops/s  p50   367.1 us  p99    461.5 us  extents 7

@@ -6,7 +6,7 @@ use crate::transaction::transaction::TxContext;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Result};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -47,6 +47,49 @@ static READAHEAD_LAST: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
 // real mount with cold reads the tradeoff may differ; enable with
 // LFS_READAHEAD=1 or set_readahead_enabled(true).
 static READAHEAD_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// G1 (3.2): block deduplication gate, default OFF (ZFS's own
+/// posture: the index costs space and every fresh block pays one
+/// probe). Enable with LFS_DEDUP=1 and a filesystem whose superblock
+/// carries a nonzero `dedupe_tree_root`.
+static DEDUP_ENABLED: AtomicBool = AtomicBool::new(false);
+
+fn dedup_enabled() -> bool {
+    DEDUP_ENABLED.load(AtomicOrdering::Relaxed)
+}
+
+/// Test/benchmark override for the dedup gate (the env-var path is
+/// mount-time; tests toggle it directly). Gate safety: callers that
+/// pass `dedupe_tree_root = 0` are unaffected by this flag.
+///
+/// Counted rather than boolean (3.3): the lib test suite runs tests in
+/// parallel threads that share this process global. Two tests that
+/// each enable dedup and each reset it on teardown used to race --
+/// one teardown flipped the gate OFF while the other test was mid-
+/// write, and its second write silently skipped the dedup probe (a
+/// one-in-hundreds flake, observed once in the 3.3 full run). With a
+/// guard count, concurrent guarded users are independent: the gate is
+/// on while ANY guard is held.
+pub fn set_dedup_enabled(enabled: bool) {
+    if enabled {
+        DEDUP_GUARDS.fetch_add(1, AtomicOrdering::AcqRel);
+        DEDUP_ENABLED.store(true, AtomicOrdering::Relaxed);
+    } else {
+        let prev = DEDUP_GUARDS.fetch_sub(1, AtomicOrdering::AcqRel);
+        if prev <= 1 {
+            DEDUP_ENABLED.store(false, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+/// Number of active `set_dedup_enabled(true)` guards.
+static DEDUP_GUARDS: AtomicU64 = AtomicU64::new(0);
+
+/// Initialize the dedup default from the environment (mount/startup).
+pub fn init_dedup_from_env() {
+    let on = std::env::var("LFS_DEDUP").map(|v| v == "1" || v.eq_ignore_ascii_case("on")).unwrap_or(false);
+    DEDUP_ENABLED.store(on, AtomicOrdering::Relaxed);
+}
 
 fn readahead_enabled() -> bool {
     READAHEAD_ENABLED.load(AtomicOrdering::Relaxed)
@@ -264,6 +307,8 @@ impl FileManager {
         bg_desc: &BlockGroupDescriptor,
         blocks_per_group: u32,
         checksum_tree_root: u64,
+        refcount_tree_root: u64,
+        dedupe_tree_root: u64,
         cctx: &BlockCipherContext,
         inode: &mut Inode,
         offset: u64,
@@ -283,6 +328,20 @@ impl FileManager {
         }
         let mut data_pos = 0;
         let mut current_offset = offset;
+
+        // The checksum-tree handle lives for the WHOLE call (Phase 3.2):
+        // constructing it per block (the old `store_block_checksum`
+        // pattern) threw away the B-tree fast-append cache after every
+        // single insert, making every insert pay the full root descent.
+        // One handle means the per-block inserts share the rightmost-
+        // leaf cache: the first block descends, the rest append in one
+        // node read + one node write. (Ascending keys are exactly the
+        // fixed-ino, ascending-logical-block pattern.)
+        let mut csum_tree = if checksum_tree_root != 0 {
+            Some(ChecksumTree::new(checksum_tree_root))
+        } else {
+            None
+        };
 
         // Phase 1 (locality): the preferred allocation start for this
         // file -- its last physical block + 1. Computed ONCE per call
@@ -311,6 +370,14 @@ impl FileManager {
         let append_write =
             !data.is_empty() && crate::allocator::extents::is_sequential_write(offset, inode.size);
 
+        // G1 (3.2): block deduplication. Off by default (ZFS's own
+        // posture -- the probe is one tree descent per fresh block and
+        // the index costs space); enabled with LFS_DEDUP=1 plus a
+        // nonzero `dedupe_tree_root`. Only fresh FULL-block,
+        // cipher-inactive writes participate: a partial write or an
+        // encrypted block is unique content by construction.
+        let dedup_on = dedupe_tree_root != 0 && !cctx.is_active() && dedup_enabled();
+
         while data_pos < data.len() {
             let logical_block = current_offset / BLOCK_SIZE as u64;
             let block_offset = (current_offset % BLOCK_SIZE as u64) as usize;
@@ -318,7 +385,179 @@ impl FileManager {
             let mut physical_block =
                 Self::get_physical_block(ctx, inode, logical_block).unwrap_or(0);
 
+            // PHASE 6 DATA CoW (completed in 3.2): if this logical block
+            // is already mapped AND its physical block is pinned by the
+            // refcount coverage tree (a dedup share holds a reference),
+            // we must NOT modify it in place. Redirect: allocate a
+            // fresh block, copy the old content over, and remap the
+            // extent. The pin itself is untouched -- the share keeps
+            // the original block, the live file moves on.
+            //
+            // PHASE 11 (birth generations): snapshots no longer pin.
+            // A live snapshot at barrier B protects a block whose
+            // BIRTH (the checksum record's generation, i.e. the stamp
+            // of the content currently at this logical block) is <=
+            // B: the frozen csum view may reference it, so redirect.
+            // A block born after B postdates every live snapshot's
+            // freeze -- no frozen view can contain this content, so
+            // in-place is provably safe. One csum-tree descent per
+            // overwritten block, ONLY while snapshots are live
+            // (barrier 0 skips it entirely: zero regression on the
+            // common path). If the record's phys disagrees with the
+            // current mapping (should not happen -- both update in
+            // one transaction), be conservative and redirect.
+            let barrier = ctx.effective_cow_barrier();
+            if physical_block != 0
+                && (refcount_tree_root != 0 || barrier > 0)
+            {
+                let pinned = if refcount_tree_root != 0 {
+                    let rc =
+                        crate::integrity::refcount::RefCountManager::new(refcount_tree_root);
+                    rc.is_pinned(ctx, physical_block)?
+                } else {
+                    false
+                };
+                let birth_protected = !pinned
+                    && barrier > 0
+                    && csum_tree.as_ref().is_some_and(|tree| {
+                        let key = ChecksumTreeKey {
+                            object_id: inode.ino,
+                            logical_block,
+                        };
+                        tree.lookup_checksum(ctx, &key)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|v| {
+                                v.physical_block == physical_block && v.generation <= barrier
+                            })
+                    });
+                if pinned || birth_protected {
+                    let new_block =
+                        Allocator::allocate_extents(ctx, bg_desc, blocks_per_group, 1)?;
+                    // Preserve the old bytes (the RMW branch below
+                    // would otherwise read the block we are abandoning).
+                    let mut old = [0u8; BLOCK_SIZE];
+                    ctx.read_block(physical_block, &mut old)?;
+                    let old_plain = if cctx.is_active() {
+                        block_cipher::decode_block(ctx, cctx, physical_block, &old)?
+                    } else {
+                        old.to_vec()
+                    };
+                    // Copy the original content to the new block FIRST
+                    // (identical bytes); the normal write path below
+                    // then layers the caller's data on top, so the
+                    // partial-block RMW semantics are preserved.
+                    if cctx.is_active() {
+                        let disk_bytes: Vec<u8> = block_cipher::encode_block(
+                            ctx,
+                            cctx,
+                            new_block,
+                            &old_plain,
+                            |c| Allocator::allocate_extents(c, bg_desc, blocks_per_group, 1),
+                        )?;
+                        ctx.write_block_owned(new_block, disk_bytes)?;
+                    } else {
+                        ctx.write_block(new_block, &old_plain)?;
+                    }
+                    Self::remap_block(
+                        ctx,
+                        bg_desc,
+                        blocks_per_group,
+                        inode,
+                        logical_block,
+                        new_block,
+                    )?;
+                    readahead_invalidate(physical_block);
+                    physical_block = new_block;
+                }
+            }
+
             if physical_block == 0 {
+                // G1 (3.2) dedup probe, BEFORE allocating: a fresh
+                // FULL-block, cipher-inactive write with dedup on first
+                // looks for an existing block with identical content.
+                // On a verified hit we map onto the existing block
+                // (share), pin it against in-place modification by
+                // EITHER owner, and skip the data write entirely.
+                if dedup_on
+                    && block_offset == 0
+                    && data.len() - data_pos >= BLOCK_SIZE
+                {
+                    let hash = crate::fs::dedupe::DeduplicationManager::hash_block(
+                        &data[data_pos..data_pos + BLOCK_SIZE],
+                    );
+                    let dtree = crate::fs::dedupe::DedupeTree::new(dedupe_tree_root);
+                    if let Some(rec) = dtree.find(ctx, hash)? {
+                        // VERIFY-ON-SHARE: trust the tree only after
+                        // re-reading and re-hashing the block. A stale
+                        // index entry (crash between record and commit,
+                        // or a freed-and-reused block) must degrade to
+                        // a normal write, never to a wrong share.
+                        let mut probe = [0u8; BLOCK_SIZE];
+                        let probe_ok = ctx
+                            .read_block(rec.physical_block, &mut probe)
+                            .map(|_| ())
+                            .is_ok();
+                        if probe_ok
+                            && crate::fs::dedupe::DeduplicationManager::hash_block(&probe)
+                                == hash
+                        {
+                            Self::add_extent(
+                                ctx,
+                                bg_desc,
+                                blocks_per_group,
+                                inode,
+                                logical_block,
+                                rec.physical_block,
+                                1,
+                            )?;
+                            let mut alloc_meta = |c: &mut TxContext| {
+                                Allocator::allocate_extents_meta(
+                                    c,
+                                    bg_desc,
+                                    blocks_per_group,
+                                    1,
+                                )
+                            };
+                            let mut dtree_mut =
+                                crate::fs::dedupe::DedupeTree::new(dedupe_tree_root);
+                            dtree_mut.increment_ref(ctx, hash, &mut alloc_meta)?;
+                            // Shared blocks are pinned: an overwrite by
+                            // EITHER inode must copy-on-write (the same
+                            // protection snapshots get).
+                            if refcount_tree_root != 0 {
+                                let mut rc = crate::integrity::refcount::RefCountManager::new(
+                                    refcount_tree_root,
+                                );
+                                if rc.coverage_at(ctx, rec.physical_block)? == 0 {
+                                    rc.pin_range(
+                                        ctx,
+                                        rec.physical_block,
+                                        1,
+                                        &mut alloc_meta,
+                                    )?;
+                                }
+                            }
+                            // Checksum records are per-(inode, logical)
+                            // and may point at a shared physical block.
+                            if let Some(tree) = csum_tree.as_mut() {
+                                Self::store_block_checksum(
+                                    ctx,
+                                    tree,
+                                    bg_desc,
+                                    blocks_per_group,
+                                    inode.ino,
+                                    logical_block,
+                                    rec.physical_block,
+                                    &probe,
+                                )?;
+                            }
+                            data_pos += BLOCK_SIZE;
+                            current_offset += BLOCK_SIZE as u64;
+                            continue;
+                        }
+                    }
+                }
                 if append_write {
                     // One speculative run for the whole call (see the
                     // comment above for why this is conflict-free).
@@ -385,12 +624,8 @@ impl FileManager {
 
             // Read-modify-write if partial block
             if chunk_size < BLOCK_SIZE && physical_block != 0 {
-                // PHASE 6 Data CoW Infrastructure:
-                // If we had the refcount_tree_root here, we would check if this physical_block
-                // has a refcount > 1. If it does, we must NOT modify it in place.
-                // We would allocate a new block, copy the existing data into the new block,
-                // decrement the refcount of the old block, and update the Inode's extent list.
-                // For now, we perform in-place modification.
+                // (The shared-block case was redirected above; a block
+                // reaching this branch is exclusively ours.)
                 let mut disk_buf = [0u8; BLOCK_SIZE];
                 ctx.read_block(physical_block, &mut disk_buf)?;
                 if cctx.is_active() {
@@ -426,10 +661,10 @@ impl FileManager {
                 readahead_invalidate(physical_block);
                 ctx.write_block_owned(physical_block, disk_bytes.clone())?;
                 // Checksum over the on-disk (post-transform) bytes.
-                if checksum_tree_root != 0 {
+                if let Some(tree) = csum_tree.as_mut() {
                     Self::store_block_checksum(
                         ctx,
-                        checksum_tree_root,
+                        tree,
                         bg_desc,
                         blocks_per_group,
                         inode.ino,
@@ -441,10 +676,25 @@ impl FileManager {
             } else {
                 readahead_invalidate(physical_block);
                 ctx.write_block(physical_block, &buf)?;
-                if checksum_tree_root != 0 {
+                // G1 (3.2): record the freshly written block in the
+                // dedup index so later identical content can share it.
+                if dedup_on && chunk_size == BLOCK_SIZE && block_offset == 0 {
+                    let hash =
+                        crate::fs::dedupe::DeduplicationManager::hash_block(&buf);
+                    let mut dtree = crate::fs::dedupe::DedupeTree::new(dedupe_tree_root);
+                    let mut alloc_meta = |c: &mut TxContext| {
+                        Allocator::allocate_extents_meta(c, bg_desc, blocks_per_group, 1)
+                    };
+                    // insert_new only if absent (an identical block
+                    // written twice in one call must not reset the count).
+                    if dtree.find(ctx, hash)?.is_none() {
+                        dtree.insert_new(ctx, hash, physical_block, &mut alloc_meta)?;
+                    }
+                }
+                if let Some(tree) = csum_tree.as_mut() {
                     Self::store_block_checksum(
                         ctx,
-                        checksum_tree_root,
+                        tree,
                         bg_desc,
                         blocks_per_group,
                         inode.ino,
@@ -468,9 +718,20 @@ impl FileManager {
 
     /// Record this block's checksum in the checksum tree. Split out of
     /// `write_file` so both cipher-mode branches share one code path.
+    /// The tree handle is owned by the CALLER (constructed once per
+    /// `write_file` call, Phase 3.2) so the B-tree fast-append cache
+    /// survives across the per-block inserts.
+    ///
+    /// 3.6 (crypto/format agility): the algorithm is POLICY, not code
+    /// -- `LFS_CSUM` selects the write-path digest (xxh64 | crc32c |
+    /// sha256 | blake3), and the chosen id is stored PER RECORD in
+    /// `ChecksumTreeValue.algorithm_id`, which the read path already
+    /// dispatches on. Mixed-algorithm images verify block-by-block;
+    /// a volume can be re-pointed at a stronger digest without a
+    /// reformat (old records keep verifying under their own ids).
     fn store_block_checksum(
         ctx: &mut TxContext,
-        checksum_tree_root: u64,
+        csum_tree: &mut ChecksumTree,
         bg_desc: &BlockGroupDescriptor,
         blocks_per_group: u32,
         ino: u64,
@@ -478,9 +739,8 @@ impl FileManager {
         physical_block: u64,
         disk_bytes: &[u8],
     ) -> Result<()> {
-        let algo = ChecksumAlgorithm::XxHash64;
+        let algo = crate::integrity::algorithms::write_path_algorithm();
         let csum_bytes = calculate_checksum(algo, disk_bytes);
-        let mut csum_tree = ChecksumTree::new(checksum_tree_root);
         let key = ChecksumTreeKey {
             object_id: ino,
             logical_block,
@@ -488,7 +748,17 @@ impl FileManager {
         let val = ChecksumTreeValue {
             physical_block,
             checksum_bytes: csum_bytes,
-            generation: 1,
+            // Phase 11 (birth generations): the BIRTH STAMP of this
+            // content at this logical block -- the node-gen stamp at
+            // write time. A snapshot at barrier B protects (redirects,
+            // retains) blocks whose birth <= B; a block born > B
+            // postdates every live snapshot's freeze, so writing it in
+            // place is provably safe. Refreshed on EVERY write of the
+            // block (in-place or redirected): the record always says
+            // when the content it describes came into existence. This
+            // is what lets `create_snapshot` skip the O(extent runs)
+            // pin walk entirely on checksummed images.
+            generation: crate::btree::tree::node_gen_stamp(),
             algorithm_id: algo as u8,
             verification_status: 1, // Verified (just written)
             padding: [0; 6],
@@ -509,10 +779,78 @@ impl FileManager {
         csum_tree.insert_checksum(ctx, key, val, &mut allocate_for_tree)
     }
 
+    /// Phase 11 (birth generations): free the physical range
+    /// `ps..ps+len` (the logical range `logical_start..+len` of
+    /// `ino`) birth-aware. Blocks whose csum-record birth is <= the
+    /// live barrier are retained (a snapshot's frozen view may
+    /// reference them; `delete_snapshot` reclaims); blocks born after
+    /// every live snapshot's freeze are freed, subject to the dedup
+    /// pin check. Barrier 0 (no snapshots) or a pin-mode image (csum
+    /// tree off) reduces to exactly the 3.2-3.4 free: pin check, then
+    /// free. Adjacent freeable blocks coalesce into one bitmap call.
+    ///
+    /// A missing csum record for a block in a checksummed image is
+    /// treated as "ancient" (birth 0, retained) -- conservative in the
+    /// safe direction, same posture as the pin walk's `.unwrap_or(true)`.
+    fn free_range_birth_aware(
+        ctx: &mut TxContext,
+        bg_desc: &BlockGroupDescriptor,
+        refcount_tree_root: u64,
+        checksum_tree_root: u64,
+        ino: u64,
+        logical_start: u64,
+        ps: u64,
+        len: u64,
+    ) -> Result<()> {
+        let free_pinned_checked = |ctx: &mut TxContext, start: u64, n: u64| -> Result<()> {
+            if refcount_tree_root != 0 {
+                let rc = crate::integrity::refcount::RefCountManager::new(refcount_tree_root);
+                if rc.is_range_pinned(ctx, start, n).unwrap_or(true) {
+                    return Ok(()); // a dedup share holds this range
+                }
+            }
+            Allocator::free_extents(ctx, bg_desc, start, n)
+        };
+
+        let barrier = ctx.effective_cow_barrier();
+        if barrier == 0 || checksum_tree_root == 0 || len == 0 {
+            return free_pinned_checked(ctx, ps, len);
+        }
+
+        // Snapshots live + checksummed: per-block birth scan.
+        let tree = ChecksumTree::new(checksum_tree_root);
+        let mut free_run: Option<(u64, u64)> = None; // (start, len)
+        for i in 0..len {
+            let logical = logical_start + i;
+            let key = ChecksumTreeKey {
+                object_id: ino,
+                logical_block: logical,
+            };
+            let birth = tree
+                .lookup_checksum(ctx, &key)?
+                .map(|v| v.generation)
+                .unwrap_or(0);
+            if birth > barrier {
+                free_run = match free_run {
+                    Some((s, l)) => Some((s, l + 1)),
+                    None => Some((ps + i, 1)),
+                };
+            } else if let Some((s, l)) = free_run.take() {
+                free_pinned_checked(ctx, s, l)?;
+            }
+        }
+        if let Some((s, l)) = free_run {
+            free_pinned_checked(ctx, s, l)?;
+        }
+        Ok(())
+    }
+
     pub fn truncate_file(
         ctx: &mut TxContext,
         bg_desc: &BlockGroupDescriptor,
         blocks_per_group: u32,
+        refcount_tree_root: u64,
+        checksum_tree_root: u64,
         inode: &mut Inode,
         new_size: u64,
     ) -> Result<()> {
@@ -527,6 +865,38 @@ impl FileManager {
 
         let new_blocks = new_size.div_ceil(BLOCK_SIZE as u64);
 
+        // Phase 11 (birth generations): freeing is birth-aware. A
+        // block whose csum-record birth is <= the live barrier may be
+        // referenced by a snapshot's frozen view -- RETAIN it (the
+        // reclaim happens in `delete_snapshot`'s walk); a block born
+        // after every live snapshot's freeze is safe to free. Dedup
+        // pins still protect their ranges on top (unchanged). With no
+        // snapshots live (barrier 0) or a pin-mode image (csum tree
+        // off) this is exactly the 3.2-3.4 behavior: pin check, then
+        // free. The per-block birth scan runs ONLY under a live
+        // snapshot -- the common truncate pays nothing extra.
+        //
+        // Cost honesty: the scan is one csum-tree descent per freed
+        // block (the records are keyed (ino, logical)). A large
+        // truncate under a live snapshot is O(blocks freed) lookups.
+        // Rare, correctness-critical, documented in phase11_txg_birth.md.
+        let free_birth_aware = |ctx: &mut TxContext,
+                                logical_start: u64,
+                                ps: u64,
+                                len: u64|
+         -> Result<()> {
+            Self::free_range_birth_aware(
+                ctx,
+                bg_desc,
+                refcount_tree_root,
+                checksum_tree_root,
+                inode.ino,
+                logical_start,
+                ps,
+                len,
+            )
+        };
+
         // Built as a fresh, compacted list rather than zeroing extents in
         // place: extents are not guaranteed to be stored in increasing
         // logical_start order (add_extent appends to the next free slot
@@ -539,16 +909,16 @@ impl FileManager {
             let extent = inode.extents[i];
 
             if extent.logical_start >= new_blocks {
-                // Free the whole extent
-                Allocator::free_extents(ctx, bg_desc, extent.physical_start, extent.length)?;
+                // Free the whole extent (birth/pin aware -- see above)
+                free_birth_aware(ctx, extent.logical_start, extent.physical_start, extent.length)?;
             } else if extent.logical_start + extent.length > new_blocks {
                 // Partial truncate of extent
                 let keep_blocks = new_blocks - extent.logical_start;
                 let free_blocks = extent.length - keep_blocks;
 
-                Allocator::free_extents(
+                free_birth_aware(
                     ctx,
-                    bg_desc,
+                    extent.logical_start + keep_blocks,
                     extent.physical_start + keep_blocks,
                     free_blocks,
                 )?;
@@ -579,21 +949,28 @@ impl FileManager {
                     length: val.length,
                 };
                 if extent.logical_start >= new_blocks {
-                    // Free the whole extent
-                    Allocator::free_extents(ctx, bg_desc, extent.physical_start, extent.length)?;
+                    // Free the whole extent (birth/pin aware)
+                    free_birth_aware(
+                        ctx,
+                        extent.logical_start,
+                        extent.physical_start,
+                        extent.length,
+                    )?;
                 } else if extent.logical_start + extent.length > new_blocks {
                     // Partial truncate of extent
                     let keep_blocks = new_blocks - extent.logical_start;
                     let free_blocks = extent.length - keep_blocks;
-                    Allocator::free_extents(
+                    free_birth_aware(
                         ctx,
-                        bg_desc,
+                        extent.logical_start + keep_blocks,
                         extent.physical_start + keep_blocks,
                         free_blocks,
                     )?;
                     // Re-insert with the surviving length (remove first
                     // because the key stays the same but the value changes).
-                    tree.remove(ctx, &log_start)?;
+                    // Phase 9: the spill tree is frozen while snapshots
+                    // are live -- removal path-copies before mutating.
+                    tree.remove_with_alloc(ctx, &log_start, &mut allocate)?;
                     tree.insert(
                         ctx,
                         log_start,
@@ -827,6 +1204,16 @@ impl FileManager {
     /// cap from the baseline, which made any file too fragmented (or
     /// simply too large under 1-block-at-a-time allocation) fail with
     /// "Max inline extents reached".
+    /// Public mapping resolver (diagnostics and tests): where does
+    /// `logical_block` of `inode` live physically? 0 = hole.
+    pub fn resolve_physical_block(
+        ctx: &mut TxContext,
+        inode: &Inode,
+        logical_block: u64,
+    ) -> Result<u64> {
+        Self::get_physical_block(ctx, inode, logical_block)
+    }
+
     fn add_extent(
         ctx: &mut TxContext,
         bg_desc: &BlockGroupDescriptor,
@@ -889,5 +1276,126 @@ impl FileManager {
             }
             tree.insert(ctx, logical_block, physical_block, length, &mut allocate)
         }
+    }
+
+    /// Redirect one logical block's mapping to a different physical
+    /// block (Phase 6 data CoW, 3.2). Splits the covering extent around
+    /// the block when needed, inline or spilled. The OLD physical block
+    /// is not freed here -- it is pinned (that is why we are remapping)
+    /// and stays owned by the snapshot/share that pinned it.
+    fn remap_block(
+        ctx: &mut TxContext,
+        bg_desc: &BlockGroupDescriptor,
+        blocks_per_group: u32,
+        inode: &mut Inode,
+        logical_block: u64,
+        new_physical: u64,
+    ) -> Result<()> {
+        // Inline extents first.
+        for i in 0..inode.extent_count as usize {
+            let e = inode.extents[i];
+            let off = logical_block - e.logical_start;
+            if logical_block >= e.logical_start && off < e.length {
+                if e.length == 1 {
+                    inode.extents[i].physical_start = new_physical;
+                    return Ok(());
+                }
+                // Split into (left, block, right) and rebuild the inline
+                // array truncate-style, spilling what does not fit.
+                let mut surviving: Vec<Extent> = Vec::with_capacity(9);
+                for j in 0..inode.extent_count as usize {
+                    if j != i {
+                        surviving.push(inode.extents[j]);
+                    }
+                }
+                if off > 0 {
+                    surviving.push(Extent {
+                        logical_start: e.logical_start,
+                        physical_start: e.physical_start,
+                        length: off,
+                    });
+                }
+                surviving.push(Extent {
+                    logical_start: logical_block,
+                    physical_start: new_physical,
+                    length: 1,
+                });
+                if off + 1 < e.length {
+                    surviving.push(Extent {
+                        logical_start: logical_block + 1,
+                        physical_start: e.physical_start + off + 1,
+                        length: e.length - off - 1,
+                    });
+                }
+                // Reset and re-add through add_extent (handles the
+                // inline capacity limit and the spill tree, and merges
+                // adjacent pieces where the split allows).
+                let pieces: Vec<Extent> = surviving;
+                for slot in inode.extents.iter_mut() {
+                    *slot = Extent {
+                        logical_start: 0,
+                        physical_start: 0,
+                        length: 0,
+                    };
+                }
+                inode.extent_count = 0;
+                for p in pieces {
+                    Self::add_extent(
+                        ctx,
+                        bg_desc,
+                        blocks_per_group,
+                        inode,
+                        p.logical_start,
+                        p.physical_start,
+                        p.length,
+                    )?;
+                }
+                return Ok(());
+            }
+        }
+
+        // Spilled extents: the covering entry is removed and its
+        // pieces re-inserted (truncate's spill pattern).
+        if inode.spill_extent_root != 0 {
+            let mut tree = crate::extents::tree::ExtentTree::new(inode.spill_extent_root);
+            if let Some((log_start, val)) = tree.btree.lookup_floor(ctx, &logical_block)? {
+                if log_start <= logical_block
+                    && logical_block < log_start + val.length
+                {
+                    let off = logical_block - log_start;
+                    let mut allocate = |c: &mut TxContext| {
+                        Allocator::allocate_extents(c, bg_desc, blocks_per_group, 1)
+                    };
+                    // Remove the whole covering extent, re-insert the pieces.
+                    // Phase 9: spill-tree removal under a live snapshot
+                    // barrier must path-copy first (frozen tree).
+                    tree.remove_with_alloc(ctx, &log_start, &mut allocate)?;
+                    if off > 0 {
+                        tree.insert(
+                            ctx,
+                            log_start,
+                            val.physical_start,
+                            off,
+                            &mut allocate,
+                        )?;
+                    }
+                    tree.insert(ctx, logical_block, new_physical, 1, &mut allocate)?;
+                    if off + 1 < val.length {
+                        tree.insert(
+                            ctx,
+                            logical_block + 1,
+                            val.physical_start + off + 1,
+                            val.length - off - 1,
+                            &mut allocate,
+                        )?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        Err(Error::new(
+            ErrorKind::NotFound,
+            "remap_block: logical block is not mapped",
+        ))
     }
 }

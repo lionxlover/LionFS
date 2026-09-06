@@ -1,0 +1,1 @@
+json: {"jobs": 1, "mode": "read-vfs", "baseline_mibps": 1451.829, "parallel_mibps": 1454.894, "scaling": 1.002}

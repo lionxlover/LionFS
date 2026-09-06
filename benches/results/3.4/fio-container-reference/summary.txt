@@ -1,0 +1,7 @@
+--- fio 3.36 on container overlay fs (buffered, psync, 10s legs) ---
+seq-write/write: 731.4 MiB/s  iops=11702  p99lat=0.00 ms
+seq-read/read: 693.2 MiB/s  iops=11091  p99lat=0.00 ms
+rand-read/read: 13.7 MiB/s  iops=3502  p99lat=0.00 ms
+rand-write/write: 637.4 MiB/s  iops=163165  p99lat=0.00 ms
+mixed/read: 12.4 MiB/s  iops=3182  p99lat=0.00 ms
+mixed/write: 5.3 MiB/s  iops=1357  p99lat=0.00 ms

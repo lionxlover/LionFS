@@ -58,6 +58,10 @@ struct Args {
     compress: bool,
     /// zstd level for the compression benchmark (default 3).
     zstd_level: i32,
+    /// Phase 9 (3.3): also measure the WRITE TAX of a live snapshot --
+    /// data-block redirects (pin coverage) + metadata path-copy CoW +
+    /// checksum-tree CoW, as a rewrite pass and a steady-state pass.
+    snapshot_tax: bool,
 }
 
 fn parse_args() -> Args {
@@ -72,6 +76,7 @@ fn parse_args() -> Args {
         chunk: 0,
         compress: false,
         zstd_level: 3,
+        snapshot_tax: false,
     };
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -91,6 +96,10 @@ fn parse_args() -> Args {
             }
             "--no-checksums" => {
                 a.checksums = false;
+                i += 1;
+            }
+            "--snapshot-tax" => {
+                a.snapshot_tax = true;
                 i += 1;
             }
             "--json" => {
@@ -141,6 +150,43 @@ struct ResultLine {
     spill_entries: u64, // entries in the per-inode spill tree (0 if none)
     spilled: bool,
     checksums: bool,
+    // G5 (3.2): per-CALL latency percentiles in MICROSECONDS for the
+    // steady-state loops that measure them (fresh-pass rows, which run
+    // exactly once per unit, carry them too; rows that do not measure
+    // latencies carry 0.0). These are CPU-path latencies of the
+    // in-process harness -- the honest sibling of the throughput
+    // columns, NOT device latencies.
+    p50_us: f64,
+    p99_us: f64,
+    p999_us: f64,
+}
+
+/// Per-call latency sampler with percentile extraction (G5, 3.2).
+/// Samples are microsecond floats; percentiles are nearest-rank.
+struct Latency {
+    samples: Vec<f64>,
+}
+
+impl Latency {
+    fn new(cap: usize) -> Self {
+        Self {
+            samples: Vec::with_capacity(cap),
+        }
+    }
+    fn record(&mut self, d: Duration) {
+        self.samples.push(d.as_secs_f64() * 1e6);
+    }
+    /// Nearest-rank percentile on the sorted samples (p in 0..=100).
+    fn pct(&mut self, p: f64) -> f64 {
+        if self.samples.is_empty() {
+            return 0.0;
+        }
+        self.samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = self.samples.len();
+        let rank = ((p / 100.0) * n as f64).ceil() as usize;
+        let idx = rank.clamp(1, n) - 1;
+        self.samples[idx]
+    }
 }
 
 /// Count a file's total extent fragments (inline + spilled) -- the
@@ -183,8 +229,11 @@ struct Env {
     blocks: u64,
     bg: BlockGroupDescriptor,
     checksum_tree_root: u64,
+    refcount_tree_root: u64,
+    dedupe_tree_root: u64,
     path: String,
     paths: Vec<String>,
+    snapshot_tax: bool,
 }
 
 fn build_env(args: &Args) -> Env {
@@ -294,7 +343,8 @@ fn build_env(args: &Args) -> Env {
         raid_profile: 0,
         padding_raid: [0; 3],
         chunk_size: 0,
-        padding2: [0; 3784],
+        padding2: [0; 3760], xattr_tree_root: 0, key_envelope_block: 0,
+        node_generation: 0,
     };
     disk.write_block(0, bytemuck::bytes_of(&sb)).unwrap();
 
@@ -322,8 +372,11 @@ fn build_env(args: &Args) -> Env {
         blocks: args.blocks,
         bg,
         checksum_tree_root,
+        refcount_tree_root: 0,
+        dedupe_tree_root: 0,
         path,
         paths,
+        snapshot_tax: args.snapshot_tax,
     }
 }
 
@@ -361,6 +414,195 @@ fn fresh_inode(ino: u64) -> Inode {
 /// reads must see the just-written state. `unit_blocks` is the number
 /// of blocks per FileManager call (1 = 4 KiB fio-style, 16 = 64 KiB
 /// fio-style, matching the plan's benchmark profile).
+
+/// Phase 9 (3.3): the snapshot WRITE-TAX group. Own image, own
+/// transaction, own environment: a fresh sequential write (baseline),
+/// a snapshot (pins + freezes roots), a full CoW rewrite pass (every
+/// data write redirects, every frozen metadata leaf path-copies once),
+/// then a steady-state rewrite pass (copies done, only the data
+/// redirect remains). All four lines are directly comparable because
+/// they share one process, one image, one code path.
+fn run_snapshot_tax_group(env: &mut Env, secs: f64) -> Vec<ResultLine> {
+    use lionfs_core::btree::tree::BTree;
+    use lionfs_core::fs::snapshots::SnapshotManager;
+    use lionfs_core::inode::tree::INODE_TREE_NODE_TYPE;
+    use lionfs_core::ondisk::serialization::Inode as Ino;
+
+    let mut out = Vec::new();
+    let unit_blocks: u64 = 16; // 64 KiB units
+    let units = REGION_BLOCKS / unit_blocks;
+    let unit_bytes = unit_blocks * BLOCK_SIZE as u64;
+    let cctx = BlockCipherContext::none();
+    let mut inode = fresh_inode(2);
+    let bpg = env.blocks as u32;
+
+    let payload = |u: u64| {
+        let mut v = Vec::with_capacity(unit_blocks as usize * BLOCK_SIZE);
+        for b in 0..unit_blocks {
+            let i = u * unit_blocks + b;
+            v.extend_from_slice(&vec![(i % 251) as u8; BLOCK_SIZE]);
+        }
+        v
+    };
+
+    let mut tx = env.tm.begin(0);
+    let mut ctx = TxContext::new(&env.disk, &mut tx);
+    Allocator::mark_blocks_used(&mut ctx, env.bg.bg_block_bitmap, 0, 16).unwrap();
+    if env.checksum_tree_root != 0 {
+        lionfs_core::integrity::checksum_tree::ChecksumTree::init_empty(
+            &mut ctx,
+            env.checksum_tree_root,
+        )
+        .unwrap();
+    }
+
+    // (a) Baseline: fresh sequential write, no snapshot.
+    let t = Instant::now();
+    for u in 0..units {
+        FileManager::write_file(
+            &mut ctx,
+            &env.bg,
+            bpg,
+            env.checksum_tree_root,
+            env.refcount_tree_root,
+            env.dedupe_tree_root,
+            &cctx,
+            &mut inode,
+            u * unit_bytes,
+            &payload(u),
+        )
+        .unwrap();
+    }
+    let el = t.elapsed().as_secs_f64();
+    out.push(ResultLine {
+        pattern: Box::leak("snap-base-fresh".to_string().into_boxed_str()),
+        mib_per_s: (REGION_BLOCKS * BLOCK_SIZE as u64) as f64 / (1024.0 * 1024.0) / el,
+        ops_per_s: units as f64 / el,
+        bytes: REGION_BLOCKS * BLOCK_SIZE as u64,
+        secs: el,
+        extents: inode.extent_count as u64,
+        spill_entries: 0,
+        spilled: inode.spill_extent_root != 0,
+        checksums: env.checksum_tree_root != 0,
+        p50_us: 0.0,
+        p99_us: 0.0,
+        p999_us: 0.0,
+    });
+
+    // (b) Snapshot: materialize the inode into a real tree, pin
+    //     everything, freeze the metadata roots. Time the creation
+    //     itself -- it is the O(extent runs) part.
+    let _ = BTree::<u64, Ino>::init_empty(&mut ctx, env.sb.inode_tree_root, INODE_TREE_NODE_TYPE);
+    let mut itree = BTree::<u64, Ino>::new(env.sb.inode_tree_root, INODE_TREE_NODE_TYPE);
+    let _ = itree.insert(&mut ctx, 2, inode, &mut |c: &mut TxContext| {
+        Allocator::allocate_extents_meta(c, &env.bg, bpg, 1)
+    });
+    env.sb.next_ino = 3;
+    let rc_root = Allocator::allocate_extents_meta(&mut ctx, &env.bg, bpg, 1).unwrap();
+    lionfs_core::integrity::refcount::RefCountManager::init_empty(&mut ctx, rc_root).unwrap();
+    let snap_root = Allocator::allocate_extents_meta(&mut ctx, &env.bg, bpg, 1).unwrap();
+    SnapshotManager::init_empty(&mut ctx, snap_root).unwrap();
+    env.sb.refcount_tree_root = rc_root;
+    env.sb.snapshot_tree_root = snap_root;
+    let mut snap = SnapshotManager::new(snap_root);
+    let alloc_snap =
+        &mut |c: &mut TxContext| Allocator::allocate_extents_meta(c, &env.bg, bpg, 1);
+    let t_snap = Instant::now();
+    snap.create_snapshot(&mut ctx, &mut env.sb, 1, 0, alloc_snap).unwrap();
+    let snap_ms = t_snap.elapsed().as_secs_f64() * 1000.0;
+    if env.checksum_tree_root != 0 {
+        eprintln!(
+            "snapshot-tax: creation {snap_ms:.3} ms (BIRTH mode: O(1) total; {} live extent runs NOT walked)",
+            inode.extent_count
+        );
+    } else {
+        eprintln!(
+            "snapshot-tax: creation {snap_ms:.3} ms (PIN mode: walk over {} extent runs + O(1) metadata)",
+            inode.extent_count
+        );
+    }
+
+    // (c) Full CoW rewrite pass under the live snapshot.
+    let t = Instant::now();
+    for u in 0..units {
+        FileManager::write_file(
+            &mut ctx,
+            &env.bg,
+            bpg,
+            env.checksum_tree_root,
+            env.refcount_tree_root,
+            env.dedupe_tree_root,
+            &cctx,
+            &mut inode,
+            u * unit_bytes,
+            &payload(u),
+        )
+        .unwrap();
+    }
+    let el = t.elapsed().as_secs_f64();
+    out.push(ResultLine {
+        pattern: Box::leak("snap-cow-first-pass".to_string().into_boxed_str()),
+        mib_per_s: (REGION_BLOCKS * BLOCK_SIZE as u64) as f64 / (1024.0 * 1024.0) / el,
+        ops_per_s: units as f64 / el,
+        bytes: REGION_BLOCKS * BLOCK_SIZE as u64,
+        secs: el,
+        extents: inode.extent_count as u64,
+        spill_entries: 0,
+        spilled: inode.spill_extent_root != 0,
+        checksums: env.checksum_tree_root != 0,
+        p50_us: 0.0,
+        p99_us: 0.0,
+        p999_us: 0.0,
+    });
+
+    // (d) Steady-state rewrite under the live snapshot (copies done;
+    //     only the per-block data redirect remains).
+    let t = Instant::now();
+    let budget = Duration::from_secs_f64(secs);
+    let mut passes: u64 = 0;
+    let mut u = 0u64;
+    let mut lat = Latency::new(64 * 1024);
+    while t.elapsed() < budget {
+        let t0 = Instant::now();
+        FileManager::write_file(
+            &mut ctx,
+            &env.bg,
+            bpg,
+            env.checksum_tree_root,
+            env.refcount_tree_root,
+            env.dedupe_tree_root,
+            &cctx,
+            &mut inode,
+            u * unit_bytes,
+            &payload(u),
+        )
+        .unwrap();
+        lat.record(t0.elapsed());
+        u += 1;
+        if u >= units {
+            u = 0;
+            passes += 1;
+        }
+    }
+    let el = t.elapsed().as_secs_f64();
+    let bytes = (passes * units + u) * unit_bytes;
+    out.push(ResultLine {
+        pattern: Box::leak("snap-steady".to_string().into_boxed_str()),
+        mib_per_s: bytes as f64 / (1024.0 * 1024.0) / el,
+        ops_per_s: (passes * units + u) as f64 / el,
+        bytes,
+        secs: el,
+        extents: inode.extent_count as u64,
+        spill_entries: 0,
+        spilled: inode.spill_extent_root != 0,
+        checksums: env.checksum_tree_root != 0,
+        p50_us: lat.pct(50.0),
+        p99_us: lat.pct(99.0),
+        p999_us: lat.pct(99.9),
+    });
+    out
+}
+
 fn run_seq_group(
     env: &mut Env,
     secs: f64,
@@ -404,6 +646,8 @@ fn run_seq_group(
             &env.bg,
             bpg,
             env.checksum_tree_root,
+            env.refcount_tree_root,
+            env.dedupe_tree_root,
             &cctx,
             &mut inode,
             u * unit_bytes,
@@ -422,6 +666,9 @@ fn run_seq_group(
         spill_entries: 0,
         spilled: inode.spill_extent_root != 0,
         checksums: with_checksums && env.checksum_tree_root != 0,
+        p50_us: 0.0,
+        p99_us: 0.0,
+        p999_us: 0.0,
     });
 
     // Record fragmentation after the fresh pass (the metric the plan
@@ -432,23 +679,29 @@ fn run_seq_group(
     out.last_mut().unwrap().spill_entries = frag_spill;
 
     // 2. Steady-state sequential write: repeated full passes (RMW
-    //    overwrite path) until the time budget is spent.
+    //    overwrite path) until the time budget is spent. Every call's
+    //    latency is sampled (G5).
     let t = Instant::now();
     let budget = Duration::from_secs_f64(secs);
     let mut passes: u64 = 0;
     let mut u = 0u64;
+    let mut lat = Latency::new(64 * 1024);
     while t.elapsed() < budget {
+        let t0 = Instant::now();
         FileManager::write_file(
             &mut ctx,
             &env.bg,
             bpg,
             env.checksum_tree_root,
+            env.refcount_tree_root,
+            env.dedupe_tree_root,
             &cctx,
             &mut inode,
             u * unit_bytes,
             &payload(u),
         )
         .unwrap();
+        lat.record(t0.elapsed());
         u += 1;
         if u >= units {
             u = 0;
@@ -457,6 +710,9 @@ fn run_seq_group(
     }
     let el = t.elapsed().as_secs_f64();
     let bytes = (passes * units + u) * unit_bytes;
+    let p50 = lat.pct(50.0);
+    let p99 = lat.pct(99.0);
+    let p999 = lat.pct(99.9);
     out.push(ResultLine {
         pattern: Box::leak(tag.to_string().into_boxed_str()),
         mib_per_s: bytes as f64 / (1024.0 * 1024.0) / el,
@@ -467,14 +723,19 @@ fn run_seq_group(
         spill_entries: 0,
         spilled: inode.spill_extent_root != 0,
         checksums: with_checksums && env.checksum_tree_root != 0,
+        p50_us: p50,
+        p99_us: p99,
+        p999_us: p999,
     });
 
     // 3. Sequential read of the file just written: full passes until
-    //    budget, `unit_bytes` per read call.
+    //    budget, `unit_bytes` per read call, per-call latencies sampled.
     let t = Instant::now();
     let mut passes: u64 = 0;
     let mut u = 0u64;
+    let mut lat_r = Latency::new(64 * 1024);
     while t.elapsed() < budget {
+        let t0 = Instant::now();
         let got = FileManager::read_file(
             &mut ctx,
             env.checksum_tree_root,
@@ -485,6 +746,7 @@ fn run_seq_group(
             unit_bytes,
         )
         .unwrap();
+        lat_r.record(t0.elapsed());
         debug_assert_eq!(got.len(), unit_bytes as usize);
         u += 1;
         if u >= units {
@@ -506,6 +768,9 @@ fn run_seq_group(
         spill_entries: 0,
         spilled: inode.spill_extent_root != 0,
         checksums: with_checksums && env.checksum_tree_root != 0,
+        p50_us: lat_r.pct(50.0),
+        p99_us: lat_r.pct(99.0),
+        p999_us: lat_r.pct(99.9),
     });
 
     out
@@ -556,6 +821,8 @@ fn run_compress_group(env: &mut Env, args: &Args) {
                 &env.bg,
                 bpg,
                 0,
+                env.refcount_tree_root,
+                env.dedupe_tree_root,
                 &cctx,
                 &mut inode,
                 off as u64,
@@ -631,7 +898,7 @@ fn run_compress_group(env: &mut Env, args: &Args) {
         let before = env.blocks
             - Allocator::count_free_blocks(&mut ctx, env.bg.bg_block_bitmap, env.blocks).unwrap();
         let t = Instant::now();
-        FileManager::write_file(&mut ctx, &env.bg, bpg, 0, &cctx, &mut inode, 0, &corpus).unwrap();
+        FileManager::write_file(&mut ctx, &env.bg, bpg, 0, env.refcount_tree_root, env.dedupe_tree_root, &cctx, &mut inode, 0, &corpus).unwrap();
         let el = t.elapsed().as_secs_f64();
         let after = env.blocks
             - Allocator::count_free_blocks(&mut ctx, env.bg.bg_block_bitmap, env.blocks).unwrap();
@@ -742,6 +1009,8 @@ fn run_raid_group(env: &mut Env, with_checksums: bool) -> Vec<ResultLine> {
                     &env.bg,
                     bpg,
                     env.checksum_tree_root,
+                    env.refcount_tree_root,
+                    env.dedupe_tree_root,
                     &cctx,
                     &mut ino,
                     u * unit_bytes,
@@ -761,6 +1030,9 @@ fn run_raid_group(env: &mut Env, with_checksums: bool) -> Vec<ResultLine> {
                 spill_entries: frag_spill,
                 spilled: ino.spill_extent_root != 0,
                 checksums: with_checksums && env.checksum_tree_root != 0,
+                        p50_us: 0.0,
+            p99_us: 0.0,
+            p999_us: 0.0,
             });
             inode = ino;
         }
@@ -783,6 +1055,9 @@ fn run_raid_group(env: &mut Env, with_checksums: bool) -> Vec<ResultLine> {
             spill_entries: 0,
             spilled: false,
             checksums: with_checksums && env.checksum_tree_root != 0,
+                p50_us: 0.0,
+        p99_us: 0.0,
+        p999_us: 0.0,
         });
     }
 
@@ -822,6 +1097,9 @@ fn run_raid_group(env: &mut Env, with_checksums: bool) -> Vec<ResultLine> {
             spill_entries: 0,
             spilled: inode.spill_extent_root != 0,
             checksums: with_checksums && env.checksum_tree_root != 0,
+                p50_us: 0.0,
+        p99_us: 0.0,
+        p999_us: 0.0,
         });
     }
 
@@ -843,6 +1121,8 @@ fn run_raid_group(env: &mut Env, with_checksums: bool) -> Vec<ResultLine> {
                     &env.bg,
                     bpg,
                     env.checksum_tree_root,
+                    env.refcount_tree_root,
+                    env.dedupe_tree_root,
                     &cctx,
                     &mut inode,
                     target,
@@ -861,6 +1141,9 @@ fn run_raid_group(env: &mut Env, with_checksums: bool) -> Vec<ResultLine> {
                 spill_entries: 0,
                 spilled: inode.spill_extent_root != 0,
                 checksums: with_checksums && env.checksum_tree_root != 0,
+                        p50_us: 0.0,
+            p99_us: 0.0,
+            p999_us: 0.0,
             });
         }
         lionfs_core::debug::stats::reset_parity_counters();
@@ -881,6 +1164,9 @@ fn run_raid_group(env: &mut Env, with_checksums: bool) -> Vec<ResultLine> {
             spill_entries: 0,
             spilled: false,
             checksums: with_checksums && env.checksum_tree_root != 0,
+                p50_us: 0.0,
+        p99_us: 0.0,
+        p999_us: 0.0,
         });
     }
     out
@@ -916,6 +1202,8 @@ fn run_rand_group(env: &mut Env, secs: f64, with_checksums: bool) -> Vec<ResultL
                 &env.bg,
                 bpg,
                 env.checksum_tree_root,
+                env.refcount_tree_root,
+                env.dedupe_tree_root,
                 &cctx,
                 &mut inode,
                 i * BLOCK_SIZE as u64,
@@ -928,8 +1216,10 @@ fn run_rand_group(env: &mut Env, secs: f64, with_checksums: bool) -> Vec<ResultL
         let t = Instant::now();
         let budget = Duration::from_secs_f64(secs);
         let mut ops = 0u64;
+        let mut lat = Latency::new(64 * 1024);
         while t.elapsed() < budget {
             let target = (rng.next() % REGION_BLOCKS as u64) * BLOCK_SIZE as u64;
+            let t0 = Instant::now();
             let _ = FileManager::read_file(
                 &mut ctx,
                 env.checksum_tree_root,
@@ -940,6 +1230,7 @@ fn run_rand_group(env: &mut Env, secs: f64, with_checksums: bool) -> Vec<ResultL
                 BLOCK_SIZE as u64,
             )
             .unwrap();
+            lat.record(t0.elapsed());
             ops += 1;
         }
         let el = t.elapsed().as_secs_f64();
@@ -954,6 +1245,9 @@ fn run_rand_group(env: &mut Env, secs: f64, with_checksums: bool) -> Vec<ResultL
             spill_entries: frag_spill,
             spilled: inode.spill_extent_root != 0,
             checksums: with_checksums && env.checksum_tree_root != 0,
+            p50_us: lat.pct(50.0),
+            p99_us: lat.pct(99.0),
+            p999_us: lat.pct(99.9),
         });
     }
 
@@ -975,19 +1269,24 @@ fn run_rand_group(env: &mut Env, secs: f64, with_checksums: bool) -> Vec<ResultL
         let t = Instant::now();
         let budget = Duration::from_secs_f64(secs);
         let mut ops = 0u64;
+        let mut lat = Latency::new(64 * 1024);
         while t.elapsed() < budget {
             let target = (rng.next() % REGION_BLOCKS as u64) * BLOCK_SIZE as u64;
+            let t0 = Instant::now();
             FileManager::write_file(
                 &mut ctx,
                 &env.bg,
                 bpg,
                 env.checksum_tree_root,
+                env.refcount_tree_root,
+                env.dedupe_tree_root,
                 &cctx,
                 &mut inode,
                 target,
                 &block(target / BLOCK_SIZE as u64),
             )
             .unwrap();
+            lat.record(t0.elapsed());
             ops += 1;
         }
         let el = t.elapsed().as_secs_f64();
@@ -1003,6 +1302,9 @@ fn run_rand_group(env: &mut Env, secs: f64, with_checksums: bool) -> Vec<ResultL
             spill_entries: frag_spill,
             spilled: inode.spill_extent_root != 0,
             checksums: with_checksums && env.checksum_tree_root != 0,
+            p50_us: lat.pct(50.0),
+            p99_us: lat.pct(99.0),
+            p999_us: lat.pct(99.9),
         });
     }
 
@@ -1013,6 +1315,21 @@ fn main() {
     let args = parse_args();
     let secs = args.secs;
 
+    if args.snapshot_tax {
+        // Dedicated env + image so the tax group cannot leak barrier /
+        // root-mirror state into the other groups' measurements.
+        let mut tax_env = build_env(&args);
+        let tax = run_snapshot_tax_group(&mut tax_env, args.secs);
+        println!("lfs_ioperf --snapshot-tax (in-process; NOT fio-comparable)");
+        for r in &tax {
+            println!(
+                "  {:<22} {:>10.2} MiB/s  {:>9.0} ops/s  p50 {:>7.1} us  p99 {:>8.1} us  extents {}",
+                r.pattern, r.mib_per_s, r.ops_per_s, r.p50_us, r.p99_us, r.extents
+            );
+        }
+        let _ = fs::remove_file(&tax_env.path);
+        return;
+    }
     let mut env = build_env(&args);
     let mut results = Vec::new();
     if args.compress {
@@ -1046,8 +1363,8 @@ fn main() {
     if args.json {
         println!("[");
         for (i, r) in results.iter().enumerate() {
-            println!("  {{\"pattern\": \"{}\", \"mib_per_s\": {:.2}, \"ops_per_s\": {:.0}, \"bytes\": {}, \"secs\": {:.3}, \"extents\": {}, \"spill_entries\": {}, \"spilled\": {}, \"checksums\": {}}}{}",
-                r.pattern, r.mib_per_s, r.ops_per_s, r.bytes, r.secs, r.extents, r.spill_entries, r.spilled, r.checksums,
+            println!("  {{\"pattern\": \"{}\", \"mib_per_s\": {:.2}, \"ops_per_s\": {:.0}, \"bytes\": {}, \"secs\": {:.3}, \"extents\": {}, \"spill_entries\": {}, \"spilled\": {}, \"checksums\": {}, \"p50_us\": {:.1}, \"p99_us\": {:.1}, \"p999_us\": {:.1}}}{}",
+                r.pattern, r.mib_per_s, r.ops_per_s, r.bytes, r.secs, r.extents, r.spill_entries, r.spilled, r.checksums, r.p50_us, r.p99_us, r.p999_us,
                 if i + 1 < results.len() { "," } else { "" });
         }
         println!("]");
@@ -1073,20 +1390,26 @@ fn main() {
         println!("                 tx per group; images are scratch and never committed");
         println!();
         println!(
-            "  {:<18} {:>10} {:>10} {:>11} {:>8} {:>9}",
-            "pattern", "MiB/s", "ops/s", "bytes", "extents", "fragments"
+            "  {:<18} {:>10} {:>10} {:>11} {:>8} {:>9} {:>9} {:>9} {:>9}",
+            "pattern", "MiB/s", "ops/s", "bytes", "extents", "fragments", "p50_us", "p99_us", "p999_us"
         );
         for r in &results {
             println!(
-                "  {:<18} {:>10.1} {:>10.0} {:>11} {:>8} {:>9}",
+                "  {:<18} {:>10.1} {:>10.0} {:>11} {:>8} {:>9} {:>9.1} {:>9.1} {:>9.1}",
                 r.pattern,
                 r.mib_per_s,
                 r.ops_per_s,
                 r.bytes,
                 r.extents,
-                r.extents + r.spill_entries
+                r.extents + r.spill_entries,
+                r.p50_us,
+                r.p99_us,
+                r.p999_us
             );
         }
+        println!();
+        println!("  latency columns are per-CALL CPU-path latencies of the in-process");
+        println!("  harness (steady-state loops); 0.0 = not measured for that row.");
     }
 
     let _ = fs::remove_file(&env.path);

@@ -4,6 +4,106 @@ use crate::transaction::transaction::TxContext;
 use bytemuck::{bytes_of, pod_read_unaligned, Pod, Zeroable};
 use std::io::{Error, ErrorKind, Result};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Global structural epoch, bumped by every node split, root growth,
+/// removal, and (re)initialization in ANY B-tree of ANY key/value type.
+/// The fast-append cache (below) records the epoch it was populated
+/// under and refuses the fast path if the epoch has moved: a split in
+/// some other tree over the same root (a second live handle) can
+/// re-shape the rightmost leaf without changing the bytes of the
+/// cached one, and the count/last-key revalidation alone cannot catch
+/// that -- the epoch check makes staleness impossible rather than
+/// merely unlikely.
+static TREE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+fn bump_epoch() {
+    TREE_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+fn current_epoch() -> u64 {
+    TREE_EPOCH.load(Ordering::Acquire)
+}
+
+// ---------------------------------------------------------------------
+// Phase 9: metadata path-copy CoW.
+//
+// Every node write is stamped with a global monotone counter
+// (`NODE_GEN`); a snapshot records the counter value at its creation
+// as its barrier. While snapshots are live, mutating a frozen-tree
+// node whose stamp is <= the barrier would corrupt the snapshot's
+// recorded view, so the mutation paths path-copy such nodes first.
+// ---------------------------------------------------------------------
+
+static NODE_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// The B-trees whose roots a snapshot RECORDS, and whose nodes must
+/// therefore never be mutated in place while a snapshot is live:
+/// inode (1), dir-name (2), per-inode spill-extent (3), and checksum
+/// (5). Every other tree (freespace, refcount, snapshot, clone,
+/// subvolume, dedup, cluster, ...) is NOT recorded by snapshots, so
+/// CoW-ing it would be pure write amplification with no correctness
+/// benefit.
+pub fn is_frozen_tree(node_type: u32) -> bool {
+    matches!(node_type, 1 | 2 | 3 | 5 | 13)
+}
+
+/// Initialize the global node-write stamp counter at mount so that
+/// new stamps start ABOVE every on-disk stamp and every persisted
+/// snapshot barrier. Idempotent; only ever moves the counter up.
+pub fn node_gen_init(floor: u64) {
+    NODE_GEN.fetch_max(floor, Ordering::AcqRel);
+}
+
+/// Current stamp high-water mark (for persisting into
+/// `sb.node_generation`).
+pub fn node_gen_current() -> u64 {
+    NODE_GEN.load(Ordering::Acquire)
+}
+
+fn node_gen_next() -> u64 {
+    NODE_GEN.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+/// Phase 11 (birth generations): a FRESH stamp for a data-block birth
+/// record. Data blocks are stamped when their content is written
+/// (checksum-tree `generation`), NOT when they are allocated; the
+/// advancing fetch_add is what makes "born after the snapshot's
+/// barrier" decidable with one comparison in the write path. Thread-safe
+/// (an atomic counter, same as node writes), so the pipelined
+/// committer's concurrent groups stamp without serialization.
+pub fn node_gen_stamp() -> u64 {
+    node_gen_next()
+}
+
+/// The effective CoW barrier for an operation: the explicit context
+/// barrier (the vfs layer sets it from the superblock) fused with the
+/// image's live-barrier mirror on the Disk (so bare-context writers --
+/// tools, library callers, tests -- still path-copy frozen nodes while
+/// a snapshot is live). Max of the two: over-copying is safe,
+/// under-copying is corruption.
+fn cow_barrier_of(ctx: &TxContext) -> u64 {
+    ctx.cow_barrier
+        .max(ctx.disk.live_barrier.load(Ordering::Acquire))
+}
+
+/// Fast-append cache entry: the tree's rightmost leaf, its item count
+/// and largest key, plus the structural epoch it was recorded under.
+/// A monotone insert (key strictly greater than `last_key`) into a
+/// not-full rightmost leaf needs no root descent at all -- one node
+/// read and one node write. That is the checksum-tree pattern (fixed
+/// ino, ascending logical block) that dominates sequential write
+/// throughput; before this cache, every per-block checksum insert paid
+/// a full root-to-leaf descent with a per-level CRC32C re-verification
+/// of the whole 4 KiB node -- the measured ~45% share of write cost
+/// (see docs/benchmarks.md).
+#[derive(Clone, Copy, Debug)]
+struct FastLeaf<K: BTreeKey> {
+    leaf_block: u64,
+    last_key: K,
+    item_count: u16,
+    epoch: u64,
+}
 
 pub trait BTreeItem: Pod + Zeroable + Clone + Copy + std::fmt::Debug {}
 impl<T: Pod + Zeroable + Clone + Copy + std::fmt::Debug> BTreeItem for T {}
@@ -32,6 +132,14 @@ unsafe impl<K: BTreeKey> Pod for KPtrPair<K> {}
 pub struct BTree<K: BTreeKey, V: BTreeItem> {
     pub root_block: u64,
     node_type: u32,
+    fast_leaf: Option<FastLeaf<K>>,
+    /// Phase 9: false (default) = LIVE-tree handle: reads honor the
+    /// root cells/Disk mirror (a moved live root is always found).
+    /// true = HISTORICAL view handle (snapshot reads, unpin walks):
+    /// `root_block` is an explicit frozen root and must be honored
+    /// verbatim -- following the live root would read post-snapshot
+    /// state into a "frozen" view.
+    frozen_view: bool,
     _marker: PhantomData<(K, V)>,
 }
 
@@ -40,23 +148,67 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
         Self {
             root_block,
             node_type,
+            fast_leaf: None,
+            frozen_view: false,
             _marker: PhantomData,
+        }
+    }
+
+    /// Phase 9: a handle over an explicitly FROZEN root (a snapshot's
+    /// recorded view). Root-cell pickup is disabled: the live tree may
+    /// have moved on, but this handle reads the recorded past.
+    pub fn new_frozen(root_block: u64, node_type: u32) -> Self {
+        Self {
+            root_block,
+            node_type,
+            fast_leaf: None,
+            frozen_view: true,
+            _marker: PhantomData,
+        }
+    }
+
+    /// The root this handle should read from: the live effective root
+    /// (root cells + Disk mirror) for live handles, the verbatim
+    /// `root_block` for frozen-view handles.
+    fn view_root(&self, ctx: &TxContext) -> u64 {
+        if self.frozen_view {
+            self.root_block
+        } else {
+            ctx.effective_root(self.node_type, self.root_block)
         }
     }
 
     /// Initializes a new empty root node on disk at `root_block`.
     pub fn init_empty(ctx: &mut TxContext, root_block: u64, node_type: u32) -> Result<()> {
+        bump_epoch(); // any prior fast-append caches for this root are void
         let node = BTreeNodeData::new(0, node_type);
         ctx.write_block(root_block, bytes_of(&node))
     }
 
     /// Helper to read a node
     fn read_node(&self, ctx: &mut TxContext, block_num: u64) -> Result<BTreeNodeData> {
+        // Dirty in THIS transaction: the bytes came through `write_node`,
+        // which set the header checksum at write time, so re-verifying
+        // the CRC32C over the full 4 KiB node on every read is pure
+        // repeated work on the insert hot path. Serve straight from the
+        // dirty map. (Phase 3.2: this removes one full-node CRC per
+        // descent level per insert for every node written earlier in
+        // the same transaction -- on the checksum-tree path that is
+        // every level except the first descent's clean reads.)
+        if ctx.tx.dirty_blocks.contains_key(&block_num) {
+            let mut buf = [0u8; 4096];
+            ctx.read_block(block_num, &mut buf)?;
+            return Ok(pod_read_unaligned(&buf));
+        }
+
         if let Some(cache) = &ctx.node_cache {
             if let Some(arc_node) = cache.get(block_num) {
                 // If it is dirty in TxContext, we still need the dirty version.
                 // Wait, if it is dirty in this transaction, we MUST read the dirty version.
                 // Check if dirty in TxContext:
+                // (Unreachable today: the dirty short-circuit above already
+                // returned. Kept for belt-and-suspenders if the guard order
+                // ever changes.)
                 if !ctx.tx.dirty_blocks.contains_key(&block_num) {
                     let locked = arc_node.read().unwrap();
                     return Ok(*locked);
@@ -71,7 +223,10 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
         if node.header.magic != BTREE_MAGIC || node.header.node_type != self.node_type {
             return Err(Error::new(
                 ErrorKind::InvalidData,
-                "Invalid BTree node magic or type",
+                format!(
+                    "Invalid BTree node magic or type (block {block_num}: magic {:#x} type {} expected {}, item_count {})",
+                    node.header.magic, node.header.node_type, self.node_type, node.header.item_count
+                ),
             ));
         }
 
@@ -114,6 +269,11 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
     fn write_node(&self, ctx: &mut TxContext, block_num: u64, node: &BTreeNodeData) -> Result<()> {
         let mut node_copy = *node;
         node_copy.header.checksum = 0;
+        // Phase 9: stamp every node write with a fresh global stamp.
+        // The stamp is what makes path-copy CoW sound: a node whose
+        // stamp is above every live snapshot barrier provably post-
+        // dates all snapshots, so mutating it in place is safe.
+        node_copy.header.generation = node_gen_next();
         let csum_bytes = calculate_checksum(ChecksumAlgorithm::Crc32c, bytes_of(&node_copy));
         node_copy.header.checksum = u32::from_le_bytes(csum_bytes[0..4].try_into().unwrap());
 
@@ -141,7 +301,10 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
     }
 
     pub fn lookup(&self, ctx: &mut TxContext, key: &K) -> Result<Option<V>> {
-        let mut current_block = self.root_block;
+        // Phase 9: live handles honor the root cells/Disk mirror (a
+        // CoW-relocated root is always found); frozen-view handles
+        // honor their recorded root verbatim.
+        let mut current_block = self.view_root(ctx);
 
         loop {
             let node = self.read_node(ctx, current_block)?;
@@ -185,7 +348,9 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
     /// floor of the block number, subject to a length check by the
     /// caller).
     pub fn lookup_floor(&self, ctx: &mut TxContext, key: &K) -> Result<Option<(K, V)>> {
-        let mut current_block = self.root_block;
+        // Phase 9: root pickup for live handles; frozen views honor
+        // their recorded root verbatim.
+        let mut current_block = self.view_root(ctx);
 
         loop {
             let node = self.read_node(ctx, current_block)?;
@@ -222,34 +387,48 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
         }
     }
 
-    /// Full iteration over every (key, value) pair in key order, by
-    /// descending to the leftmost leaf and walking the `next_leaf`
-    /// chain. Used by extent-spill-aware truncate/free paths to visit
-    /// every spilled extent. O(n) reads; not for hot paths.
+    /// Full iteration over every (key, value) pair in key order.
+    /// Used by extent-spill-aware truncate/free paths to visit every
+    /// spilled extent. O(n) reads; not for hot paths.
+    ///
+    /// Phase 9: this walks the tree STRUCTURE (internal child
+    /// pointers), not the `next_leaf` sibling chain. Under metadata
+    /// CoW a copied leaf is only reachable through the parent's
+    /// repointed child pointer; the old chain still threads through
+    /// the frozen originals, so a chain walk would silently skip the
+    /// copies and return stale contents. (Split surgery still keeps
+    /// the chain truthful for the frozen views that recorded it.)
     pub fn iter_all(&self, ctx: &mut TxContext) -> Result<Vec<(K, V)>> {
-        // Descend leftmost pointers to the leftmost leaf.
-        let mut current_block = self.root_block;
+        let root = self.view_root(ctx);
         let mut out = Vec::new();
-        loop {
-            let node = self.read_node(ctx, current_block)?;
-            let count = node.header.item_count as usize;
-            if node.header.level == 0 {
-                let items: &[KVPair<K, V>] = bytemuck::cast_slice(
-                    &node.payload[..count * std::mem::size_of::<KVPair<K, V>>()],
-                );
-                for kv in items {
-                    out.push((kv.key, kv.value));
-                }
-                if node.header.next_leaf == 0 {
-                    break;
-                }
-                current_block = node.header.next_leaf;
-            } else {
-                let leftmost_ptr: u64 = pod_read_unaligned(&node.payload[0..8]);
-                current_block = leftmost_ptr;
-            }
-        }
+        self.collect_pairs(ctx, root, &mut out)?;
         Ok(out)
+    }
+
+    /// In-order traversal via internal child pointers: leaves in key
+    /// order, following exactly the pointers a CoW repoint keeps
+    /// current.
+    fn collect_pairs(&self, ctx: &mut TxContext, block: u64, out: &mut Vec<(K, V)>) -> Result<()> {
+        let node = self.read_node(ctx, block)?;
+        let count = node.header.item_count as usize;
+        if node.header.level == 0 {
+            let items: &[KVPair<K, V>] = bytemuck::cast_slice(
+                &node.payload[..count * std::mem::size_of::<KVPair<K, V>>()],
+            );
+            for kv in items {
+                out.push((kv.key, kv.value));
+            }
+            return Ok(());
+        }
+        let leftmost: u64 = pod_read_unaligned(&node.payload[0..8]);
+        self.collect_pairs(ctx, leftmost, out)?;
+        let items: &[KPtrPair<K>] = bytemuck::cast_slice(
+            &node.payload[8..8 + count * std::mem::size_of::<KPtrPair<K>>()],
+        );
+        for kv in items {
+            self.collect_pairs(ctx, kv.ptr, out)?;
+        }
+        Ok(())
     }
 
     pub fn insert<F>(
@@ -262,17 +441,77 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
     where
         F: FnMut(&mut TxContext) -> Result<u64>,
     {
+        // FAST-APPEND PATH (Phase 3.2). A monotone key (strictly
+        // greater than the cached rightmost-leaf maximum), a not-full
+        // leaf, and an unchanged structural epoch let us skip the root
+        // descent entirely: read the leaf, revalidate it against the
+        // cached (count, last_key), append the pair at the end, write
+        // the leaf back. The revalidation makes a stale cache FAIL
+        // SAFE: any mismatch falls through to the ordinary descent.
+        if let Some(fl) = self.fast_leaf {
+            let safe_count = fl.item_count as usize;
+            if key > fl.last_key
+                && safe_count > 0
+                && safe_count < Self::max_leaf_items() - 1
+                && fl.epoch == current_epoch()
+            {
+                if let Ok(node) = self.read_node(ctx, fl.leaf_block) {
+                    if node.header.level == 0
+                        && node.header.item_count as usize == safe_count
+                    {
+                        let pair = KVPair { key, value };
+                        let sz = std::mem::size_of::<KVPair<K, V>>();
+                        let last_at = (safe_count - 1) * sz;
+                        let last =
+                            pod_read_unaligned::<KVPair<K, V>>(&node.payload[last_at..last_at + sz]);
+                        // Phase 9: the cached leaf may be FROZEN (stamp
+                        // <= the snapshot barrier). Appending in place
+                        // would corrupt the snapshot's recorded view, so
+                        // a frozen leaf always takes the slow descent,
+                        // where the CoW pass copies it first.
+                        let barrier = cow_barrier_of(ctx);
+                        let leaf_frozen = barrier > 0
+                            && is_frozen_tree(self.node_type)
+                            && node.header.generation <= barrier;
+                        if last.key == fl.last_key && !leaf_frozen {
+                            let mut node = node;
+                            let at = safe_count * sz;
+                            node.payload[at..at + sz]
+                                .copy_from_slice(bytes_of(&pair));
+                            node.header.item_count += 1;
+                            self.write_node(ctx, fl.leaf_block, &node)?;
+                            self.fast_leaf = Some(FastLeaf {
+                                leaf_block: fl.leaf_block,
+                                last_key: key,
+                                item_count: node.header.item_count,
+                                epoch: fl.epoch,
+                            });
+                            return Ok(());
+                        }
+                    }
+                }
+                // Revalidation failed: something reshaped this leaf
+                // behind our back. Invalidate and take the slow road.
+                self.fast_leaf = None;
+            }
+        }
+
         // Simple insert without split support first, to establish structure
         let mut path = Vec::new();
-        let mut current_block = self.root_block;
+        // Phase 9: root-cell pickup -- a CoW move earlier in this same
+        // transaction may have relocated the live root past what the
+        // (stale) superblock value says.
+        let mut current_block = self.view_root(ctx);
+        self.root_block = current_block;
+
+        // Whether this descent always took the rightmost child at every
+        // level -- if so, the leaf we land in is the tree's rightmost
+        // leaf, and a successful insert into it can (re)populate the
+        // fast-append cache with the leaf's true maximum key.
+        let mut rightmost = true;
 
         // Find leaf
         let mut node = loop {
-            // CoW logic: if node generation <= last_snapshot_generation, CoW it!
-            // Wait, we don't have access to last_snapshot_generation here easily unless we pass it.
-            // Let's pass `generation: u64` and `last_snapshot: u64` in `TxContext` or as parameters.
-            // But we don't want to change the signature if possible.
-            // Wait, we do have `ctx`. Maybe `TxContext` doesn't have it.
             let n = self.read_node(ctx, current_block)?;
             path.push(current_block);
             if n.header.level == 0 {
@@ -284,6 +523,12 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
             let items: &[KPtrPair<K>] =
                 bytemuck::cast_slice(&n.payload[8..8 + count * std::mem::size_of::<KPtrPair<K>>()]);
 
+            // Rightmost-child check: the descent is still rightmost iff
+            // the key is at or past this node's LAST separator.
+            if count > 0 && key < items[count - 1].key {
+                rightmost = false;
+            }
+
             let mut next_block = leftmost_ptr;
             for kv in items {
                 if key >= kv.key {
@@ -294,6 +539,22 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
             }
             current_block = next_block;
         };
+
+        // ------------------------------------------------------------------
+        // PHASE 9 METADATA CoW: with a live snapshot barrier, every node
+        // on this descent whose stamp is <= the barrier MAY be part of
+        // a frozen view recorded by a snapshot. Path-copy such nodes
+        // (repointing their parents at the copies) BEFORE the mutation
+        // below touches them. Each node is copied at most once per
+        // snapshot epoch: the copy is stamped above the barrier, so
+        // later descents take it in place. Non-frozen trees and
+        // barrier 0 (no snapshots) skip this entirely.
+        // ------------------------------------------------------------------
+        if cow_barrier_of(ctx) > 0 && is_frozen_tree(self.node_type) {
+            let effective = self.cow_descent_path(ctx, &path, &mut allocate_block)?;
+            path = effective;
+            current_block = *path.last().expect("descent path is non-empty");
+        }
 
         let count = node.header.item_count as usize;
         if count >= Self::max_leaf_items() - 1 {
@@ -326,6 +587,7 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
                 let bytes = bytemuck::cast_slice(&items[..count]);
                 node.payload[..bytes.len()].copy_from_slice(bytes);
                 self.write_node(ctx, current_block, &node)?;
+                self.refresh_fast_leaf_if_rightmost(current_block, rightmost, &items[count - 1], node.header.item_count);
                 return Ok(());
             }
             Err(idx) => idx,
@@ -343,7 +605,31 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
         node.header.item_count += 1;
         let bytes = bytemuck::cast_slice(&items);
         node.payload[..bytes.len()].copy_from_slice(bytes);
-        self.write_node(ctx, current_block, &node)
+        self.write_node(ctx, current_block, &node)?;
+        self.refresh_fast_leaf_if_rightmost(current_block, rightmost, &items[count], node.header.item_count);
+        Ok(())
+    }
+
+    /// Populate the fast-append cache after a slow-path insert that
+    /// landed (by proof of the descent, not by hope) in the tree's
+    /// rightmost leaf. `last` is the leaf's post-insert maximum key
+    /// (the caller knows whether the new pair or an existing one is
+    /// the maximum), `item_count` its post-insert count.
+    fn refresh_fast_leaf_if_rightmost(
+        &mut self,
+        leaf_block: u64,
+        rightmost: bool,
+        last: &KVPair<K, V>,
+        item_count: u16,
+    ) {
+        if rightmost {
+            self.fast_leaf = Some(FastLeaf {
+                leaf_block,
+                last_key: last.key,
+                item_count,
+                epoch: current_epoch(),
+            });
+        }
     }
 
     fn split_leaf<F>(
@@ -357,6 +643,11 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
     where
         F: FnMut(&mut TxContext) -> Result<u64>,
     {
+        // A split reshapes the leaf chain: every fast-append cache in
+        // every handle over this tree (or any tree -- the epoch is
+        // global and conservative) is void until re-proven.
+        bump_epoch();
+        self.fast_leaf = None;
         let right_block = allocate_block(ctx)?;
         let mut right_node = BTreeNodeData::new(0, self.node_type);
         right_node.header.next_leaf = leaf_node.header.next_leaf;
@@ -577,9 +868,56 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
         Ok(None)
     }
 
+    /// Remove without an allocator. Safe for every NON-frozen tree
+    /// (freespace, refcount, snapshot, clone, subvolume, dedup,
+    /// cluster): the Phase 9 CoW pass never runs for them, so the
+    /// allocator is never invoked. Removing from a FROZEN tree (inode,
+    /// dir, spill-extent, checksum) while a snapshot barrier is live
+    /// returns an error instead of silently mutating a frozen view --
+    /// use [`remove_with_alloc`] there.
     pub fn remove(&mut self, ctx: &mut TxContext, key: &K) -> Result<bool> {
+        let mut no_alloc = |_ctx: &mut TxContext| -> Result<u64> {
+            Err(Error::new(
+                ErrorKind::OutOfMemory,
+                "BTree::remove on a frozen tree under a snapshot barrier \
+                 requires an allocator (use remove_with_alloc)",
+            ))
+        };
+        self.remove_inner(ctx, key, &mut no_alloc)
+    }
+
+    /// Remove with an allocator for frozen-tree CoW copies. Identical
+    /// to [`remove`] when no snapshot barrier is live.
+    pub fn remove_with_alloc<F>(
+        &mut self,
+        ctx: &mut TxContext,
+        key: &K,
+        mut allocate_block: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(&mut TxContext) -> Result<u64>,
+    {
+        self.remove_inner(ctx, key, &mut allocate_block)
+    }
+
+    fn remove_inner<F>(
+        &mut self,
+        ctx: &mut TxContext,
+        key: &K,
+        mut allocate_block: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(&mut TxContext) -> Result<u64>,
+    {
+        // Removals (and any future merges they grow) change leaf
+        // contents and can empty the rightmost leaf: the fast-append
+        // cache cannot survive them.
+        bump_epoch();
+        self.fast_leaf = None;
         let mut path = Vec::new();
-        let mut current_block = self.root_block;
+        // Phase 9: root-cell pickup (same rationale as insert).
+        let mut current_block = self.view_root(ctx);
+        self.root_block = current_block;
 
         // Find leaf
         let mut node = loop {
@@ -604,6 +942,15 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
             }
             current_block = next_block;
         };
+
+        // PHASE 9 METADATA CoW: same path-copy pass as insert -- a
+        // frozen node on this descent must be copied before the
+        // removal mutates it in place.
+        if cow_barrier_of(ctx) > 0 && is_frozen_tree(self.node_type) {
+            let effective = self.cow_descent_path(ctx, &path, &mut allocate_block)?;
+            path = effective;
+            current_block = *path.last().expect("descent path is non-empty");
+        }
 
         let count = node.header.item_count as usize;
         let old_items: &[KVPair<K, V>] =
@@ -635,6 +982,97 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
                 Ok(true)
             }
             Err(_) => Ok(false), // Key not found
+        }
+    }
+
+    /// Phase 9 metadata path-copy CoW: given the descent `path` (root
+    /// .. leaf, ORIGINAL block numbers), copy every node whose stored
+    /// stamp is <= the CoW barrier into a fresh private block and
+    /// repoint its parent at the copy. Returns the effective path
+    /// (same length; entry i is the original block if it needed no
+    /// copy, or the fresh copy if it did). A copied root updates
+    /// `self.root_block` AND the transaction's root cell, so every
+    /// later handle -- and the superblock sync at commit -- finds the
+    /// live tree.
+    ///
+    /// Soundness argument: a node with stamp <= barrier was last
+    /// written before some live snapshot existed, so a frozen view MAY
+    /// reach it and in-place mutation could corrupt that view. A node
+    /// with stamp > barrier was written after EVERY live snapshot was
+    /// created (the caller maintains the barrier as the max stamp over
+    /// live snapshots), so no frozen view can include it. The copy is
+    /// stamped with the CURRENT global counter, which sits above every
+    /// persisted barrier, making it provably private.
+    fn cow_descent_path<F>(
+        &mut self,
+        ctx: &mut TxContext,
+        path: &[u64],
+        allocate_block: &mut F,
+    ) -> Result<Vec<u64>>
+    where
+        F: FnMut(&mut TxContext) -> Result<u64>,
+    {
+        let barrier = cow_barrier_of(ctx);
+        debug_assert!(barrier > 0 && is_frozen_tree(self.node_type));
+        let mut effective: Vec<u64> = Vec::with_capacity(path.len());
+        for (i, &orig) in path.iter().enumerate() {
+            let mut node = self.read_node(ctx, orig)?;
+            if node.header.generation > barrier {
+                // Provably private: mutate in place below.
+                effective.push(orig);
+                continue;
+            }
+            let copy_block = allocate_block(ctx)?;
+            if i > 0 {
+                // Keep the bookkeeping parent pointer truthful in the
+                // copy (navigation uses child pointers, never this).
+                node.header.parent_block = effective[i - 1];
+            }
+            // Copy the node AS-IS; write_node stamps it with a fresh
+            // generation above every barrier, making it private.
+            self.write_node(ctx, copy_block, &node)?;
+            if i == 0 {
+                // The root moved: the root cell is the source of truth
+                // until the superblock sync at commit.
+                self.root_block = copy_block;
+                ctx.set_root_cell(self.node_type, copy_block);
+            } else {
+                // Fix the parent's child pointer. The parent's effective
+                // block is effective[i-1]: either the original (private
+                // -- stamp > barrier -- so in-place restamping by
+                // write_node is fine) or its fresh copy (also private).
+                let parent_block = effective[i - 1];
+                let mut parent = self.read_node(ctx, parent_block)?;
+                Self::replace_child_ptr(&mut parent, orig, copy_block);
+                self.write_node(ctx, parent_block, &parent)?;
+            }
+            effective.push(copy_block);
+        }
+        Ok(effective)
+    }
+
+    /// Replace the child pointer `old` with `new` in an internal node
+    /// (leftmost pointer slot plus every separator item). Leaves have
+    /// no child pointers; a no-op there is defensive.
+    fn replace_child_ptr(node: &mut BTreeNodeData, old: u64, new: u64) {
+        if node.header.level == 0 {
+            return;
+        }
+        let leftmost: u64 = pod_read_unaligned(&node.payload[0..8]);
+        if leftmost == old {
+            node.payload[0..8].copy_from_slice(bytemuck::bytes_of(&new));
+        }
+        let count = node.header.item_count as usize;
+        if count == 0 {
+            return;
+        }
+        let itemsz = std::mem::size_of::<KPtrPair<K>>();
+        let items: &mut [KPtrPair<K>] =
+            bytemuck::cast_slice_mut(&mut node.payload[8..8 + count * itemsz]);
+        for kv in items.iter_mut() {
+            if kv.ptr == old {
+                kv.ptr = new;
+            }
         }
     }
 
@@ -751,7 +1189,8 @@ mod tests {
             padding_raid: [0; 3],
             chunk_size: 0,
             crypto_tree_root: 0,
-            padding2: [0; 3784],
+            padding2: [0; 3760], xattr_tree_root: 0, key_envelope_block: 0,
+            node_generation: 0,
         };
         disk.write_block(0, bytemuck::bytes_of(&sb)).unwrap();
 
@@ -785,6 +1224,279 @@ mod tests {
         // Lookup missing
         let val = btree.lookup(&mut ctx, &TestKey(10001)).unwrap();
         assert_eq!(val, None);
+    }
+
+    /// A zeroed-but-valid Superblock for test disk images (the inline
+    /// literal above, factored out so the fast-append tests below stay
+    /// readable).
+    fn test_sb() -> Superblock {
+        let mut sb = Superblock {
+            magic: 0,
+            version: 0,
+            block_size: 4096,
+            total_blocks: 1024,
+            free_blocks: 0,
+            inode_count: 0,
+            root_inode: 0,
+            flags: 0,
+            padding1: 0,
+            bitmap_start: 0,
+            inode_table_start: 0,
+            data_region_start: 0,
+            generation: 0,
+            checksum: 0,
+            padding_csum: 0,
+            journal_start: 1,
+            journal_blocks: 10,
+            secondary_sb_1: 0,
+            secondary_sb_2: 0,
+            block_group_count: 0,
+            blocks_per_group: 0,
+            inode_tree_root: 0,
+            dir_tree_root: 0,
+            extent_tree_root: 0,
+            freespace_tree_root: 0,
+            next_ino: 2,
+            checksum_tree_root: 0,
+            bad_blocks_root: 0,
+            snapshot_tree_root: 0,
+            clone_tree_root: 0,
+            refcount_tree_root: 0,
+            subvolume_tree_root: 0,
+            space_map_root: 0,
+            last_snapshot_generation: 0,
+            dedupe_tree_root: 0,
+            key_tree_root: 0,
+            fs_features: 0,
+            default_compression: 0,
+            default_encryption: 0,
+            padding_phase7: [0; 6],
+            device_tree_root: 0,
+            pool_uuid: [0; 16],
+            raid_profile: 0,
+            padding_raid: [0; 3],
+            chunk_size: 0,
+            crypto_tree_root: 0,
+            padding2: [0; 3760], xattr_tree_root: 0, key_envelope_block: 0,
+            node_generation: 0,
+        };
+        sb.block_size = 4096;
+        sb
+    }
+
+    /// Sequential inserts take the fast-append path after the first
+    /// insert; the resulting tree must be byte-for-byte equivalent to
+    /// the slow path's: every key findable, `validate` happy, and the
+    /// item count exact.
+    #[test]
+    fn fast_append_matches_slow_path_sequential() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_btree_fast_seq.img");
+        let mut disk = Disk::create(&path, 1024 * 1024 * 10).unwrap();
+        let sb = test_sb();
+        disk.write_block(0, bytemuck::bytes_of(&sb)).unwrap();
+        let tm = TransactionManager::new(&sb);
+        let mut tx = tm.begin(0);
+        let mut ctx = TxContext::new(&mut disk, &mut tx);
+
+        BTree::<TestKey, TestValue>::init_empty(&mut ctx, 100, 1).unwrap();
+        let mut btree = BTree::<TestKey, TestValue>::new(100, 1);
+        let mut next_block = 101;
+        let mut allocator = |_: &mut TxContext| {
+            let b = next_block;
+            next_block += 1;
+            Ok(b)
+        };
+
+        for i in 0..3000 {
+            btree
+                .insert(&mut ctx, TestKey(i), TestValue(i * 3), &mut allocator)
+                .unwrap();
+        }
+        for i in 0..3000 {
+            assert_eq!(
+                btree.lookup(&mut ctx, &TestKey(i)).unwrap(),
+                Some(TestValue(i * 3)),
+                "key {i}"
+            );
+        }
+        assert_eq!(btree.lookup(&mut ctx, &TestKey(3000)).unwrap(), None);
+        assert_eq!(btree.iter_all(&mut ctx).unwrap().len(), 3000);
+        assert!(btree.validate(&mut ctx).unwrap() > 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Ascending runs interleaved with mid-tree inserts and overwrites:
+    /// the fast cache is populated, invalidated by splits, repopulated,
+    /// and bypassed for existing keys -- all orders must stay findable.
+    #[test]
+    fn fast_append_survives_interleaved_mid_inserts() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_btree_fast_mixed.img");
+        let mut disk = Disk::create(&path, 1024 * 1024 * 10).unwrap();
+        let sb = test_sb();
+        disk.write_block(0, bytemuck::bytes_of(&sb)).unwrap();
+        let tm = TransactionManager::new(&sb);
+        let mut tx = tm.begin(0);
+        let mut ctx = TxContext::new(&mut disk, &mut tx);
+
+        BTree::<TestKey, TestValue>::init_empty(&mut ctx, 100, 1).unwrap();
+        let mut btree = BTree::<TestKey, TestValue>::new(100, 1);
+        let mut next_block = 101;
+        let mut allocator = |_: &mut TxContext| {
+            let b = next_block;
+            next_block += 1;
+            Ok(b)
+        };
+
+        // Ascending blocks of 200, with a mid insert and an overwrite of
+        // an existing key between blocks.
+        let mut top = 0u64;
+        for round in 0..15 {
+            for i in 0..200 {
+                let k = top + i;
+                btree
+                    .insert(&mut ctx, TestKey(k), TestValue(k + 1), &mut allocator)
+                    .unwrap();
+            }
+            top += 200;
+            // Mid insert (forces a slow-path descent; may split).
+            btree
+                .insert(&mut ctx, TestKey(7 + round), TestValue(999), &mut allocator)
+                .unwrap();
+            // Overwrite an existing key (never a fast append: equal key).
+            btree
+                .insert(&mut ctx, TestKey(50), TestValue(4242), &mut allocator)
+                .unwrap();
+        }
+        for i in 0..top {
+            // keys 7..=21 were mid-inserted (rounds 0..=14) to 999;
+            // key 50 was overwritten to 4242; everything else is k+1.
+            let expected = if (7..=21).contains(&i) {
+                999
+            } else if i == 50 {
+                4242
+            } else {
+                i + 1
+            };
+            assert_eq!(
+                btree.lookup(&mut ctx, &TestKey(i)).unwrap(),
+                Some(TestValue(expected)),
+                "key {i}"
+            );
+        }
+        // mid inserts hit existing keys; no new keys beyond top
+        assert_eq!(btree.iter_all(&mut ctx).unwrap().len(), top as usize);
+        assert!(btree.validate(&mut ctx).unwrap() > 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE safety property of the epoch guard: handle A caches the
+    /// rightmost leaf; handle B (a second live handle over the same
+    /// root) grows the tree past it, splitting leaves; A's next
+    /// monotone insert must NOT land in its stale cached leaf. Without
+    /// the epoch check this test corrupts the tree (A's key becomes
+    /// unreachable by descent).
+    #[test]
+    fn two_handles_epoch_safety() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_btree_two_handles.img");
+        let mut disk = Disk::create(&path, 1024 * 1024 * 10).unwrap();
+        let sb = test_sb();
+        disk.write_block(0, bytemuck::bytes_of(&sb)).unwrap();
+        let tm = TransactionManager::new(&sb);
+        let mut tx = tm.begin(0);
+        let mut ctx = TxContext::new(&mut disk, &mut tx);
+
+        BTree::<TestKey, TestValue>::init_empty(&mut ctx, 100, 1).unwrap();
+        let mut a = BTree::<TestKey, TestValue>::new(100, 1);
+        let mut b = BTree::<TestKey, TestValue>::new(100, 1);
+        let mut next_block = 101;
+        let mut allocator = |_: &mut TxContext| {
+            let blk = next_block;
+            next_block += 1;
+            Ok(blk)
+        };
+
+        // A fills 0..2000 (caches the rightmost leaf under epoch E).
+        for i in 0..2000 {
+            a.insert(&mut ctx, TestKey(i), TestValue(i), &mut allocator)
+                .unwrap();
+        }
+        // B -- which has NO cache and will split -- appends 2000..3000.
+        // Splits bump the global epoch; A's cache is now provably stale.
+        for i in 2000..3000 {
+            b.insert(&mut ctx, TestKey(i), TestValue(i), &mut allocator)
+                .unwrap();
+        }
+        // A inserts again, monotone w.r.t. ITS cached last key (1999).
+        for i in 3000..3200 {
+            a.insert(&mut ctx, TestKey(i), TestValue(i), &mut allocator)
+                .unwrap();
+        }
+        // A fresh handle must find every key A and B ever inserted.
+        let c = BTree::<TestKey, TestValue>::new(100, 1);
+        for i in 0..3200 {
+            assert_eq!(
+                c.lookup(&mut ctx, &TestKey(i)).unwrap(),
+                Some(TestValue(i)),
+                "key {i} unreachable -- stale fast-append cache corrupted the tree"
+            );
+        }
+        assert_eq!(c.iter_all(&mut ctx).unwrap().len(), 3200);
+        assert!(c.validate(&mut ctx).unwrap() > 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `remove` must invalidate the fast-append cache: removing the
+    /// tree maximum and then appending a higher key has to land in the
+    /// true rightmost leaf, not a cached phantom.
+    #[test]
+    fn remove_invalidates_fast_path() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_btree_rm_fast.img");
+        let mut disk = Disk::create(&path, 1024 * 1024 * 10).unwrap();
+        let sb = test_sb();
+        disk.write_block(0, bytemuck::bytes_of(&sb)).unwrap();
+        let tm = TransactionManager::new(&sb);
+        let mut tx = tm.begin(0);
+        let mut ctx = TxContext::new(&mut disk, &mut tx);
+
+        BTree::<TestKey, TestValue>::init_empty(&mut ctx, 100, 1).unwrap();
+        let mut btree = BTree::<TestKey, TestValue>::new(100, 1);
+        let mut next_block = 101;
+        let mut allocator = |_: &mut TxContext| {
+            let blk = next_block;
+            next_block += 1;
+            Ok(blk)
+        };
+
+        for i in 0..500 {
+            btree
+                .insert(&mut ctx, TestKey(i), TestValue(i), &mut allocator)
+                .unwrap();
+        }
+        for k in (400..500).rev() {
+            assert!(btree.remove(&mut ctx, &TestKey(k)).unwrap());
+        }
+        // Append beyond the (now smaller) tree maximum.
+        for i in 500..600 {
+            btree
+                .insert(&mut ctx, TestKey(i), TestValue(i), &mut allocator)
+                .unwrap();
+        }
+        for i in 0..400 {
+            assert_eq!(btree.lookup(&mut ctx, &TestKey(i)).unwrap(), Some(TestValue(i)));
+        }
+        for i in 400..500 {
+            assert_eq!(btree.lookup(&mut ctx, &TestKey(i)).unwrap(), None, "removed key {i} resurrected");
+        }
+        for i in 500..600 {
+            assert_eq!(btree.lookup(&mut ctx, &TestKey(i)).unwrap(), Some(TestValue(i)));
+        }
+        assert_eq!(btree.iter_all(&mut ctx).unwrap().len(), 500);
+        assert!(btree.validate(&mut ctx).unwrap() > 0);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -839,7 +1551,8 @@ mod tests {
             padding_raid: [0; 3],
             chunk_size: 0,
             crypto_tree_root: 0,
-            padding2: [0; 3784],
+            padding2: [0; 3760], xattr_tree_root: 0, key_envelope_block: 0,
+            node_generation: 0,
         };
         disk.write_block(0, bytemuck::bytes_of(&sb)).unwrap();
 
@@ -923,7 +1636,8 @@ mod tests {
             padding_raid: [0; 3],
             chunk_size: 0,
             crypto_tree_root: 0,
-            padding2: [0; 3784],
+            padding2: [0; 3760], xattr_tree_root: 0, key_envelope_block: 0,
+            node_generation: 0,
         };
         disk.write_block(0, bytemuck::bytes_of(&sb)).unwrap();
 

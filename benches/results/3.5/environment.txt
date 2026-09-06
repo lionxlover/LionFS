@@ -1,0 +1,2 @@
+== container: 5.10.134-013.8.3.kangaroo.al8.x86_64, 2 vCPU, backing: overlay, LionFS 3.5.0 ==
+model name	: Intel(R) Xeon(R) Processor

@@ -29,6 +29,43 @@ pub fn is_valid_superblock_block(buffer: &[u8; BLOCK_SIZE]) -> Option<Superblock
     }
 }
 
+/// Phase 9 (metadata CoW): persist the superblock to EVERY candidate
+/// slot, checksum recomputed. Writing all three (rather than rotating
+/// one) keeps recovery trivial -- `pick_best` takes the
+/// highest-generation valid copy, so a torn write of one slot is
+/// outvoted by the other two. The caller must invoke this only AFTER
+/// the journal commit fsync'd every block the (possibly moved) tree
+/// roots point at; between that fsync and this write a crash costs
+/// exactly the root move (the journal replay re-applies the blocks,
+/// but the old superblock still roots the pre-move tree, which is a
+/// consistent, merely older, filesystem).
+///
+/// The generation is set to `generation_floor` (the transaction id
+/// whose blocks are becoming reachable), keeping
+/// `sb.generation` monotone with transaction ids so journal recovery's
+/// "tx_id > sb.generation" replay test keeps working.
+pub fn write_all_slots(
+    disk: &crate::disk::block_io::Disk,
+    sb: &Superblock,
+    generation_floor: u64,
+) -> std::io::Result<()> {
+    let mut sb_out = *sb;
+    sb_out.generation = sb_out.generation.max(generation_floor);
+    sb_out.checksum = 0;
+    sb_out.checksum = crate::utils::crc::compute_checksum(bytes_of(&sb_out));
+    let mut buf = [0u8; BLOCK_SIZE];
+    buf[..std::mem::size_of::<Superblock>()].copy_from_slice(bytes_of(&sb_out));
+    for &loc in CANDIDATE_LOCATIONS.iter() {
+        // Slots beyond the device capacity are neither reserved in the
+        // bitmap nor reachable at mount (read_block would hit EOF);
+        // writing them would silently EXTEND the image file.
+        if loc < sb.total_blocks {
+            disk.write_block(loc, &buf)?;
+        }
+    }
+    disk.sync()
+}
+
 /// Picks the highest-`generation` valid superblock among a set of raw
 /// candidate blocks (one per `CANDIDATE_LOCATIONS` entry, in the same
 /// order, `None` for a location that couldn't be read at all).

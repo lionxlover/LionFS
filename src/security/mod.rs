@@ -1,4 +1,5 @@
 pub mod acl;
+pub mod posix_acl;
 pub mod block_cipher;
 pub mod encryption;
 pub mod kdf;

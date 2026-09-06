@@ -1,0 +1,5 @@
+snapshot-tax: creation 0.015 ms (BIRTH mode: O(1) total; 7 live extent runs NOT walked)
+lfs_ioperf --snapshot-tax (in-process; NOT fio-comparable)
+  snap-base-fresh           1107.20 MiB/s      17715 ops/s  p50     0.0 us  p99      0.0 us  extents 7
+  snap-cow-first-pass        375.55 MiB/s       6009 ops/s  p50     0.0 us  p99      0.0 us  extents 7
+  snap-steady                919.28 MiB/s      14708 ops/s  p50    66.2 us  p99     89.7 us  extents 7

@@ -1,0 +1,2 @@
+json: {"jobs": 2, "mode": "durable-1024k", "baseline_mibps": 526.378, "parallel_mibps": 519.682, "scaling": 0.987}
+json: {"jobs": 2, "mode": "durable-1024k", "baseline_mibps": 512.129, "parallel_mibps": 502.091, "scaling": 0.980}

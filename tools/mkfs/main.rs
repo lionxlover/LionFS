@@ -72,6 +72,16 @@ fn main() {
     // newly created files (per-inode property set at creation from the
     // superblock default).
     let compress = args.iter().any(|a| a == "--compress");
+    // 3.6 (crypto agility): --passphrase <secret> (or LFS_PASSPHRASE)
+    // writes an EnvelopeV2 to `key_envelope_block` -- the volume is
+    // unlockable only with the passphrase (mount gate; kdf/aead ids
+    // stored for future agility).
+    let passphrase: Option<String> = args
+        .iter()
+        .position(|a| a == "--passphrase")
+        .and_then(|i| args.get(i + 1).cloned())
+        .or_else(|| std::env::var("LFS_PASSPHRASE").ok())
+        .filter(|p| !p.is_empty());
 
     // Optional multi-device / RAID setup. Backward compatible: with no
     // trailing --raid flag, this behaves exactly as the original
@@ -194,6 +204,9 @@ fn main() {
     let key_tree_root_blk = 15;
     let crypto_tree_root_blk = 16;
     let dedupe_tree_root_blk = 17;
+    // Phase 9: the snapshot registry tree gets its own reserved root
+    // so `lfs_snapshot create` works on a freshly formatted image.
+    let snapshot_tree_root_blk = 18;
 
     let pool_uuid = Uuid::new_v4().unwrap_or(Uuid::nil());
 
@@ -202,7 +215,16 @@ fn main() {
         version: lionfs_core::common::version::CURRENT_VERSION,
         block_size: BLOCK_SIZE as u32,
         total_blocks,
-        free_blocks: total_blocks - (journal_start + journal_blocks), // Subtract metadata and journal
+        // Subtract metadata, journal, AND the in-range secondary
+        // superblock slots (3.6 accounting fix: the slots are marked
+        // used in the bitmap, so the superblock must agree or the
+        // conformance battery's bitmap check fails).
+        free_blocks: total_blocks
+            - (journal_start + journal_blocks)
+            - lionfs_core::ondisk::superblock::CANDIDATE_LOCATIONS
+                .iter()
+                .filter(|&&l| l > 0 && l < total_blocks)
+                .count() as u64,
         inode_count,
         root_inode: 1,
         flags: 0,
@@ -226,7 +248,7 @@ fn main() {
         next_ino: 2,
         checksum_tree_root: checksum_tree_root_blk,
         bad_blocks_root: bad_blocks_root_blk,
-        snapshot_tree_root: 0,
+        snapshot_tree_root: snapshot_tree_root_blk,
         clone_tree_root: 0,
         refcount_tree_root: 0,
         subvolume_tree_root: 0,
@@ -248,7 +270,10 @@ fn main() {
         padding_raid: [0; 3],
         chunk_size: chunk_size_blocks,
         crypto_tree_root: crypto_tree_root_blk,
-        padding2: [0; BLOCK_SIZE - 312],
+        padding2: [0; BLOCK_SIZE - 336],
+        xattr_tree_root: 0,
+        key_envelope_block: 0,
+        node_generation: 0,
     };
 
     // Calculate checksum
@@ -284,6 +309,22 @@ fn main() {
         let byte_idx = (i / 8) as usize;
         let bit_idx = i % 8;
         bitmap_buf[byte_idx] |= 1 << bit_idx;
+    }
+    // Phase 11 (layout-collision fix, found live by the pipelined
+    // durability money test): the secondary superblock slots
+    // (CANDIDATE_LOCATIONS 8192 / 16384) live INSIDE the data region
+    // and were never reserved -- when the allocation frontier reached
+    // one, `write_all_slots` stamped the superblock over whatever
+    // file or tree block the allocator had placed there (live data
+    // corruption: whole pages read back as zeros or torn trees). Mark
+    // every in-range candidate slot used so the allocator can never
+    // hand them out.
+    for &slot in lionfs_core::ondisk::superblock::CANDIDATE_LOCATIONS.iter() {
+        if slot > 0 && slot < total_blocks {
+            let byte_idx = (slot / 8) as usize;
+            let bit_idx = slot % 8;
+            bitmap_buf[byte_idx] |= 1 << bit_idx;
+        }
     }
     disk.write_block(bitmap_start, &bitmap_buf).unwrap();
     for i in 1..bitmap_blocks {
@@ -362,8 +403,50 @@ fn main() {
         )
         .unwrap();
         lionfs_core::fs::dedupe::DedupeTree::init_empty(&mut ctx, sb.dedupe_tree_root).unwrap();
+        lionfs_core::fs::snapshots::SnapshotManager::init_empty(&mut ctx, sb.snapshot_tree_root)
+            .unwrap();
     }
     tm.commit(&disk, &sb, &tx).unwrap();
+
+    // 3.6: optional passphrase envelope. Written AFTER the metadata
+    // commit, into the first data block (which the bitmap has already
+    // reserved as used... it has NOT -- so allocate block
+    // data_region_start explicitly and mark it used below).
+    if let Some(secret) = &passphrase {
+        let (blob, _envelope) =
+            lionfs_core::security::kdf::EnvelopeV2::create(
+                secret.as_bytes(),
+                lionfs_core::security::kdf::KDF_PBKDF2_HMAC_SHA256,
+                lionfs_core::common::constants::ENCRYPTION_CHACHA20_POLY1305,
+                lionfs_core::security::kdf::DEFAULT_PBKDF2_ITERATIONS,
+            )
+            .expect("envelope create");
+        let env_block = sb.data_region_start; // first block after the journal
+        disk.write_block(env_block, &lionfs_core::security::kdf::envelope_to_block(&blob))
+            .unwrap();
+        // Persist the pointer + feature bit in every superblock slot.
+        let mut sb2 = sb;
+        sb2.key_envelope_block = env_block;
+        sb2.fs_features |= lionfs_core::common::version::FS_FEATURE_ENVELOPE_V2;
+        sb2.checksum = lionfs_core::utils::checksum::calculate_superblock_checksum(&sb2);
+        for &slot in lionfs_core::ondisk::superblock::CANDIDATE_LOCATIONS.iter() {
+            if slot < sb2.total_blocks {
+                disk.write_block(slot, bytemuck::bytes_of(&sb2)).unwrap();
+            }
+        }
+        // Reserve the envelope block in the bitmap so the allocator
+        // never hands it out.
+        let mut bitmap_buf = [0u8; BLOCK_SIZE];
+        disk.read_block(bitmap_start, &mut bitmap_buf).unwrap();
+        let byte_idx = (env_block / 8) as usize;
+        let bit_idx = env_block % 8;
+        bitmap_buf[byte_idx] |= 1 << bit_idx;
+        disk.write_block(bitmap_start, &bitmap_buf).unwrap();
+        println!(
+            "Volume passphrase envelope written (block {}, kdf=pbkdf2-sha256, aead=chacha20poly1305). Mount requires the passphrase.",
+            env_block
+        );
+    }
 
     disk.sync().unwrap();
     println!("Format complete! Pool UUID: {}", pool_uuid);

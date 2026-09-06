@@ -162,18 +162,57 @@ and the journal TLA+ model — is Phase 9-scoped.
 
 ```mermaid
 flowchart LR
+    G0["3.2 closed: data CoW live, dedup wired, latency percentiles measured"] --> DONE["shipped in 3.2.0"]
     G1["Structures and policies tested beside the live paths"] --> AB["Interleaved A/B switch protocol (RFC-002 2.4)"]
     G2["Repair planning without automated repair"] --> W2["Scrubber to healer to allocator wiring"]
     G3["Live allocator is first-fit"] --> W3["Shard free-queues as the integration point"]
     G4["No Windows mounting"] --> W4["WinFsp bridge (RFC-003 binding design)"]
+    G5["SHIPPED 3.3: metadata path-copy CoW, O(1)-metadata snapshots"] --> DONE5["shipped in 3.3.0"]
+    G6["SHIPPED 3.5: O(1)-total snapshot creation via csum-tree birth generations (no format change)"] --> DONE6["shipped in 3.5.0"]
+    G7["SHIPPED 3.4: parallel write path, &self VfsOps, write-back intake, group commit"] --> DONE7["shipped in 3.4.0"]
+    G8["Never measured through a real mount"] --> DONE8["SHIPPED 3.3: benchmarks/fio framework (numbers only from real runs)"]
     AB --> P9["Phase 9 and beyond"]
     W2 --> P9
     W3 --> P9
     W4 --> P9
+    W5 --> P9
+    DONE7 -.-> P11["SHIPPED 3.5: pipelined txg commit + lock-free readers (fs overlap commit I/O)"]
+    P11 -.-> P10["successors: parallel staging (node latches), multi-threaded FUSE dispatch, vfs NodeCache"]
+    DONE5 -.-> P10
+    DONE8 -.-> HW["real hardware runs"]
 ```
 
 Counting the open surface: Phase 8 has one open entry, Phase 9 lists
 four, and the partially-done Phase 2 and Phase 4 items land on the
 same switch protocol — the remaining wiring concentrates in Phase 9:
 
-$$|\mathrm{Phase\ 8\ open}| = 1, \qquad |\mathrm{Phase\ 9}| = 4\ \mathrm{open\ items}$$
+$$|\mathrm{Phase\ 8\ open}| = 1, \qquad |\mathrm{Phase\ 9}| = 5\ \mathrm{open\ items}$$
+
+(One of the old Phase 9 entries — "wire the data-path CoW" — shipped
+in 3.2.0; its successor, metadata-tree CoW for O(1) snapshots, SHIPPED
+in 3.3.0 together with the mounted-fio framework and the SMP read
+benchmark. The successor gaps it left — per-extent birth stamps and
+write concurrency — BOTH shipped: parallel writes in 3.4.0, and in
+3.5.0 the O(1)-total snapshot creation via checksum-tree birth
+generations (the format-v3 question was answered by riding the field
+the csum records already carry — no format change needed) plus the
+pipelined transaction-group commit. The remaining honest successors:
+parallel staging (node latches — staging is still single-writer CPU
+work), multi-threaded FUSE dispatch (fuser 0.12 is single-loop), the
+vfs read path's NodeCache, real-hardware fio runs, and field miles.)
+
+## Phase 12: The 3.6 release — POSIX completeness, self-heal, agility, Format Vault — done
+- [x] Extended attributes + POSIX ACLs (XattrTree type 13, LXAT blocks,
+      draft-17 ACL codec, FUSE surface, default-ACL inheritance)
+- [x] Reflink clones (copy_file_range -> shared extents + refcount pins,
+      clone registry, real lfs_clone tool)
+- [x] Wired self-heal scrub (real verify loop, healer executor with
+      parity/mirror reconstruction verified against checksums, bad-block
+      ledger iter/clear, SharedCore::stage_and_commit)
+- [x] Crypto/format agility (LFS_CSUM policy, EnvelopeV2 on disk with
+      kdf/aead/KEM ids, mkfs --passphrase, mount gate)
+- [x] Format Vault (feature flags + core mount gate, conformance battery,
+      lfs_conformance, real lfs_upgrade, live free-space accounting)
+- [x] Snapshot send/recv (LFSS v1 stream, frozen-view walk, digest + manifest
+      verification, lfs_replicate send|recv|list)
+- [x] Test suite 762 -> **790** (794 io_uring), debug + release green

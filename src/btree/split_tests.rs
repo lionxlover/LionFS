@@ -82,7 +82,8 @@ fn setup(_name: &str) -> (Disk, TransactionManager, Superblock, String) {
         raid_profile: 0,
         padding_raid: [0; 3],
         chunk_size: 0,
-        padding2: [0; 3784],
+        padding2: [0; 3760], xattr_tree_root: 0, key_envelope_block: 0,
+            node_generation: 0,
     };
     disk.write_block(0, bytemuck::bytes_of(&sb)).unwrap();
     let tm = TransactionManager::new(&sb);

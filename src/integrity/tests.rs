@@ -62,7 +62,8 @@ mod tests {
             padding_raid: [0; 3],
             chunk_size: 0,
             crypto_tree_root: 0,
-            padding2: [0; 3784],
+            padding2: [0; 3760], xattr_tree_root: 0, key_envelope_block: 0,
+            node_generation: 0,
         };
 
         let tm = TransactionManager::new(&sb);

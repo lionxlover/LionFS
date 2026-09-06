@@ -37,6 +37,11 @@ flowchart TB
 | area | result |
 |---|---|
 | seq64k-write-fresh | 561 -> 832 MiB/s (+48.4%) |
+| 3.2 fast-append + dirty-CRC skip | 832 -> 1107 MiB/s (+33.1%, cross-session) |
+| 3.2 latency percentiles (p50/p99/p999, us) | seq4k-write 2.7/7.1/18.2 |
+| 3.3 snapshot write tax (--snapshot-tax) | 178.5 -> 163.0 (first CoW pass) -> 168.6 (steady) MiB/s |
+| 3.3 SMP read scaling (lfs_smpbench) | 1.26x at 2 jobs (shared cache), 1.41x (no cache) |
+| 3.3 mounted-fio framework | benchmarks/fio/ -- zero shipped numbers, runs on real hardware |
 | seq64k-read | 1197 -> 1454 MiB/s (+21.4%) |
 | extent fragments, fresh 32 MiB file | 8192 -> 8 |
 | RAID5-6dev random-write commit (incremental parity) | +71.0% |
@@ -78,3 +83,25 @@ cargo build --release --bin lfs_ioperf
 Raw outputs for every phase are checked in under `benches/results/`.
 Cross-filesystem numbers: see the honest answer in
 [`docs/comparison.md`](docs/comparison.md) -- none exist.
+
+
+## 3.4 — the vfs surface is finally measurable in parallel
+
+Phase 10 made `VfsOps` `&self` with a write-back intake page cache and
+group commit; `lfs_smpbench --write/--read-vfs` drives N threads
+through one shared mount (release, 2-vCPU container,
+`benches/results/3.4/`):
+
+| measurement | 1 job | 2 jobs | scaling |
+|---|---|---|---|
+| buffered write intake (64-KiB calls) | 3036 MiB/s | 4292 MiB/s | **1.41x** |
+| durable write (fsync per 1 MiB) | 512 MiB/s | 502 MiB/s | 0.98x (staging-bound) |
+| read, `&self` vfs path | 1455 MiB/s | 1608 MiB/s | 1.11x |
+
+The 3.3 mount could not enter a 2-job configuration at all (every op
+serialized on `&mut self`), so the 1-job row was its ceiling. Also
+archived: a real source-built fio 3.36 running the same job shapes on
+the container's overlay backing (seq-64k w 731 / r 693 MiB/s, rand-4k
+r 13.7 / w 637 buffered) -- hardware context, not a
+mounted-vs-mounted claim (still no `/dev/fuse` here; that stays with
+`benchmarks/fio/run-comparison.sh` on real boxes).

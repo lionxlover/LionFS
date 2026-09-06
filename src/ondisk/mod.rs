@@ -1,4 +1,5 @@
 pub mod bitmap;
+pub mod conformance;
 pub mod block_group;
 pub mod directory;
 pub mod extent;
@@ -6,6 +7,7 @@ pub mod inode;
 pub mod inode_v3;
 pub mod object_header;
 pub mod serialization;
+pub mod xattr;
 pub mod superblock;
 pub mod upgrade;
 pub mod validation;

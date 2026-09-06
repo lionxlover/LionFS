@@ -23,7 +23,8 @@ fn main() {
         snapshot_tree_root: 0, clone_tree_root: 0, refcount_tree_root: 0, subvolume_tree_root: 0, space_map_root: 0, last_snapshot_generation: 0,
         dedupe_tree_root: 0, key_tree_root: 0, fs_features: 0, default_compression: 0, default_encryption: 0,
         padding_phase7: [0; 6], device_tree_root: 0, pool_uuid: [0; 16], raid_profile: 0, padding_raid: [0; 3],
-        chunk_size: 0, crypto_tree_root: 0, padding2: [0; 3784],
+        chunk_size: 0, crypto_tree_root: 0, padding2: [0; 3760], xattr_tree_root: 0, key_envelope_block: 0,
+        node_generation: 0,
     };
     disk.write_block(0, bytemuck::bytes_of(&sb)).unwrap();
 

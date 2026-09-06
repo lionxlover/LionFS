@@ -1,0 +1,2 @@
+json: {"jobs": 2, "mode": "buffered", "baseline_mibps": 3034.675, "parallel_mibps": 4242.836, "scaling": 1.398}
+json: {"jobs": 2, "mode": "buffered", "baseline_mibps": 3035.629, "parallel_mibps": 4292.047, "scaling": 1.414}

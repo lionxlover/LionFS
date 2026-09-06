@@ -31,6 +31,12 @@ pub const ENOSYS: i32 = 38; // Function not implemented
 pub const ENOTEMPTY: i32 = 39; // Directory not empty
 pub const EDQUOT: i32 = 122; // Quota exceeded
 pub const EBADE: i32 = 52; // Invalid exchange (LionFS: unsupported media op)
+// 3.6 (xattrs / ACLs): the remaining errnos the extended-attribute and
+// ACL surface needs. Same Linux ABI values (the FUSE wire values).
+pub const E2BIG: i32 = 7; // Argument list too long (xattr: name too long)
+pub const ERANGE: i32 = 34; // Result too large (xattr buffer too small)
+pub const ENODATA: i32 = 61; // No data available (xattr: ENOATTR on Linux)
+pub const EOPNOTSUPP: i32 = 95; // Operation not supported (xattr on this file kind)
 
 // -- file type bits ----------------------------------------------------------
 
@@ -102,6 +108,12 @@ pub fn io_error_to_errno(err: &Error) -> i32 {
             std::io::ErrorKind::IsADirectory => EISDIR,
             std::io::ErrorKind::InvalidInput => EINVAL,
             std::io::ErrorKind::ReadOnlyFilesystem => EROFS,
+            // 3.6 (xattrs): the remaining kinds the extended-attribute
+            // surface produces.
+            std::io::ErrorKind::StorageFull => ENOSPC,
+            std::io::ErrorKind::OutOfMemory => ENOSPC, // B-tree split with no allocator
+            std::io::ErrorKind::Unsupported => EOPNOTSUPP,
+            std::io::ErrorKind::InvalidData => ENODATA, // corrupt/unparsable xattr blob
             _ => EIO,
         },
     }

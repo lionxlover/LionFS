@@ -69,6 +69,45 @@ pub fn verify_checksum(algo: ChecksumAlgorithm, data: &[u8], expected: &[u8; 32]
     }
 }
 
+/// 3.6 (crypto/format agility): the WRITE-path digest policy. The
+/// read path dispatches on each record's own `algorithm_id`, so this
+/// can change per mount without touching existing data -- the
+/// definition of checksum agility on a live format.
+///
+/// `LFS_CSUM` = xxh64 (default, the 3.5 behavior) | crc32c | sha256 |
+/// blake3. An unknown value falls back to xxh64 (and names itself in
+/// a one-time stderr note the first time it is parsed).
+pub fn write_path_algorithm() -> ChecksumAlgorithm {
+    use std::sync::OnceLock;
+    static ALGO: OnceLock<ChecksumAlgorithm> = OnceLock::new();
+    *ALGO.get_or_init(|| {
+        match std::env::var("LFS_CSUM").as_deref() {
+            Ok("crc32c") => ChecksumAlgorithm::Crc32c,
+            Ok("sha256") => ChecksumAlgorithm::Sha256,
+            Ok("blake3") => ChecksumAlgorithm::Blake3,
+            Ok("xxh64") | Err(_) => ChecksumAlgorithm::XxHash64,
+            Ok(other) => {
+                eprintln!("lfs: unknown LFS_CSUM '{other}', using xxh64");
+                ChecksumAlgorithm::XxHash64
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod agility_tests {
+    use super::*;
+
+    #[test]
+    fn write_path_policy_defaults_to_xxh64() {
+        // (No env manipulation in-process -- OnceLock caches; the
+        // default without LFS_CSUM set is the 3.5 behavior.)
+        if std::env::var("LFS_CSUM").is_err() {
+            assert_eq!(write_path_algorithm(), ChecksumAlgorithm::XxHash64);
+        }
+    }
+}
+
 #[cfg(test)]
 mod blake3_tests {
     use super::*;

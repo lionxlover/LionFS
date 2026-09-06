@@ -51,6 +51,8 @@ pub fn copy_file_contents(
             bg_desc,
             blocks_per_group,
             checksum_tree_root,
+            0, // no refcount coverage tree in the copy path (shares are not pinned)
+            0, // dedup off in the copy path: content identity is preserved by the copy itself
             dst_cctx,
             dst,
             offset,

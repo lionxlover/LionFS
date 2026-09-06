@@ -7,6 +7,7 @@ use crate::ondisk::serialization::BLOCK_SIZE;
 use crate::pool::raid::{RaidEngine, RaidProfile};
 
 use rayon::prelude::*;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 // 2.0: positioned I/O goes through the platform abstraction layer
@@ -18,6 +19,24 @@ use crate::pal::file::{pread_full, pwrite_full};
 pub struct Disk {
     files: Vec<Arc<File>>,
     pub raid_engine: RaidEngine,
+    /// Phase 9 (metadata CoW): this image's live snapshot barrier,
+    /// maintained by SnapshotManager create/delete and initialized at
+    /// mount from `sb.last_snapshot_generation`. Kept ON THE DISK (not
+    /// the TxContext) so that ANY writer through ANY context --
+    /// including tools and library callers that build a bare
+    /// `TxContext::new` -- still path-copies frozen nodes while a
+    /// snapshot is live. Per-Disk scoping means it can never over- or
+    /// under-estimate another image's barrier.
+    pub live_barrier: AtomicU64,
+    /// Phase 9 (metadata CoW): current roots of the image's FROZEN
+    /// trees -- [inode(type 1), dir-name(type 2), checksum(type 5)] --
+    /// updated whenever a path-copy moves one. This is the SOURCE OF
+    /// TRUTH for readers between a root move and the superblock sync
+    /// at commit: a handle built from a stale superblock value still
+    /// finds the live tree. (Spill-tree roots live inside inode
+    /// entries, which the inode-tree CoW already freezes.) 0 = never
+    /// moved, fall back to the caller's root.
+    pub frozen_roots: [AtomicU64; 3],
     /// Probed geometry per device (Phase 2). For plain image files this
     /// is (file length, 512) -- geometry probing only means something
     /// against real block devices, which is exactly why it is probed
@@ -66,6 +85,33 @@ fn read_full(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
 }
 
 impl Disk {
+    /// Map a frozen-tree node_type to its `frozen_roots` slot.
+    /// (Shared with the B-tree layer; defined here so the slot order
+    /// lives next to the field it indexes.)
+    pub fn frozen_root_slot(node_type: u32) -> Option<usize> {
+        match node_type {
+            1 => Some(0), // inode tree
+            2 => Some(1), // dir-name tree
+            5 => Some(2), // checksum tree
+            _ => None,
+        }
+    }
+
+    /// Current root of frozen tree `node_type`, or None if it never
+    /// moved (caller falls back to its superblock value).
+    pub fn frozen_root(&self, node_type: u32) -> Option<u64> {
+        let slot = Self::frozen_root_slot(node_type)?;
+        let r = self.frozen_roots[slot].load(std::sync::atomic::Ordering::Acquire);
+        (r != 0).then_some(r)
+    }
+
+    /// Record that frozen tree `node_type`'s live root is now `root`.
+    pub fn set_frozen_root(&self, node_type: u32, root: u64) {
+        if let Some(slot) = Self::frozen_root_slot(node_type) {
+            self.frozen_roots[slot].store(root, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     /// Opens a single-device (RAID `Single`) filesystem. For a multi-device
     /// pool, use `open_pool`.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -76,6 +122,8 @@ impl Disk {
         Ok(Self {
             files: vec![Arc::new(file)],
             raid_engine: RaidEngine::new(RaidProfile::Single, 0, 1),
+            live_barrier: AtomicU64::new(0),
+            frozen_roots: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             geometries: vec![geo],
         })
     }
@@ -111,6 +159,8 @@ impl Disk {
         Ok(Self {
             files,
             raid_engine: RaidEngine::new(profile, chunk_size_blocks, num_devices),
+            live_barrier: AtomicU64::new(0),
+            frozen_roots: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             geometries,
         })
     }
@@ -128,6 +178,8 @@ impl Disk {
         Ok(Self {
             files: vec![Arc::new(file)],
             raid_engine: RaidEngine::new(RaidProfile::Single, 0, 1),
+            live_barrier: AtomicU64::new(0),
+            frozen_roots: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             geometries: vec![geo],
         })
     }
@@ -169,6 +221,8 @@ impl Disk {
         Ok(Self {
             files,
             raid_engine: RaidEngine::new(profile, chunk_size_blocks, num_devices),
+            live_barrier: AtomicU64::new(0),
+            frozen_roots: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             geometries,
         })
     }
@@ -194,6 +248,33 @@ impl Disk {
         buf: &mut [u8],
     ) -> Result<()> {
         read_full(&self.files[device], buf, physical_block * BLOCK_SIZE as u64)
+    }
+
+    /// 3.6 (self-heal scrub): raw positioned write to ONE device --
+    /// the scrubber's repair write. This intentionally bypasses the
+    /// RAID layer: a repair writes back data that has already been
+    /// verified against its checksum (parity stays consistent with
+    /// the restored data because the rebuild derived it from parity
+    /// itself), and the write is idempotent (a torn repair write
+    /// leaves the block still-corrupt, which the next sweep heals
+    /// again). Metadata consequences (verification status, the
+    /// bad-block ledger) go through the journal like every other
+    /// writer, NOT through here.
+    pub fn write_block_direct(
+        &self,
+        device: usize,
+        physical_block: u64,
+        buf: &[u8],
+    ) -> Result<()> {
+        if device >= self.files.len() {
+            return Err(Error::new(ErrorKind::InvalidInput, "device index out of range"));
+        }
+        pwrite_full(
+            &self.files[device],
+            buf,
+            physical_block * BLOCK_SIZE as u64,
+        )?;
+        Ok(())
     }
 
     pub fn read_block(&self, block_num: u64, buf: &mut [u8]) -> Result<()> {

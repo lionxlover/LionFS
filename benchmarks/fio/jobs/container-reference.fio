@@ -1,0 +1,60 @@
+# Container reference legs (Phase 10, 3.4): the SAME job shapes as
+# lionfs-workloads.fio, sized for a constrained container (no loop
+# devices, no /dev/fuse, no root), run against a plain directory on
+# whatever filesystem backs the container (overlay on the host).
+#
+# What these numbers mean (see README): a mature kernel filesystem
+# stack delivering the same I/O shapes in the same 2-vCPU environment
+# as the LionFS harness/vfs numbers archived beside them. They are a
+# CONTEXT reference, not a mounted-vs-mounted comparison -- that
+# requires run-comparison.sh on real hardware with /dev/fuse.
+[seq-write]
+filename=__DIR__/fseq.bin
+rw=write
+bs=64k
+ioengine=psync
+size=512m
+runtime=10
+time_based=1
+group_reporting=1
+
+[seq-read]
+filename=__DIR__/fseq.bin
+rw=read
+bs=64k
+ioengine=psync
+size=512m
+runtime=10
+time_based=1
+group_reporting=1
+
+[rand-read]
+filename=__DIR__/fseq.bin
+rw=randread
+bs=4k
+ioengine=psync
+size=512m
+runtime=10
+time_based=1
+group_reporting=1
+
+[rand-write]
+filename=__DIR__/fseq.bin
+rw=randwrite
+bs=4k
+ioengine=psync
+size=512m
+runtime=10
+time_based=1
+group_reporting=1
+
+[mixed]
+filename=__DIR__/fseq.bin
+rw=randrw
+rwmixread=70
+bs=4k
+ioengine=psync
+size=512m
+runtime=10
+time_based=1
+group_reporting=1

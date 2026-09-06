@@ -30,6 +30,7 @@ impl Allocator {
         };
         if let Some(start) = run {
             ctx.alloc_cursor = Some(start + count);
+            ctx.tx.alloc_delta += count as i64;
             Ok(start)
         } else {
             let cursor_dbg = ctx.alloc_cursor;
@@ -86,6 +87,7 @@ impl Allocator {
             .or_else(|| Self::scan_free_run(ctx, bg_desc, blocks_per_group, count, 0, count));
         if let Some(start) = run {
             ctx.alloc_cursor = Some(start + count);
+            ctx.tx.alloc_delta += count as i64;
             Ok(start)
         } else {
             let free =
@@ -141,6 +143,7 @@ impl Allocator {
                 )
             })?;
         ctx.meta_high_water = (bpg.saturating_sub(run)).max(ctx.meta_high_water) + count - 1;
+        ctx.tx.alloc_delta += count as i64;
         Ok(run)
     }
 
@@ -204,6 +207,7 @@ impl Allocator {
                 )
             })?;
         ctx.alloc_cursor = Some(start + mark);
+        ctx.tx.alloc_delta += mark as i64;
         Ok(start)
     }
 
@@ -289,6 +293,7 @@ impl Allocator {
         start: u64,
         count: u64,
     ) -> Result<()> {
+        ctx.tx.alloc_delta -= count as i64;
         Self::mark_blocks_free(ctx, bg_desc.bg_block_bitmap, start, count)
     }
 

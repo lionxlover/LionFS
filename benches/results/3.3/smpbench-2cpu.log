@@ -1,0 +1,27 @@
+LionFS SMP read benchmark (3.3)
+image: /tmp/smp.img | files: 5 | data: 31 MiB | jobs: 2 | mode: sequential | cache: shared
+NOTE: single-writer path; this measures READ scaling only.
+
+baseline  (1 job ):   328.86 MiB/s in 3.0s
+parallel  (2 jobs):   413.36 MiB/s in 3.0s (aggregate)
+
+scaling: 1.26x at 2 jobs (63% efficiency)
+json: {"jobs": 2, "baseline_mibps": 328.862, "parallel_mibps": 413.362, "scaling": 1.257}
+LionFS SMP read benchmark (3.3)
+image: /tmp/smp.img | files: 5 | data: 31 MiB | jobs: 2 | mode: rand4k | cache: shared
+NOTE: single-writer path; this measures READ scaling only.
+
+baseline  (1 job ):   338.67 MiB/s in 3.0s
+parallel  (2 jobs):   387.53 MiB/s in 3.0s (aggregate)
+
+scaling: 1.14x at 2 jobs (57% efficiency)
+json: {"jobs": 2, "baseline_mibps": 338.670, "parallel_mibps": 387.531, "scaling": 1.144}
+LionFS SMP read benchmark (3.3)
+image: /tmp/smp.img | files: 5 | data: 31 MiB | jobs: 2 | mode: sequential | cache: off
+NOTE: single-writer path; this measures READ scaling only.
+
+baseline  (1 job ):    98.49 MiB/s in 3.1s
+parallel  (2 jobs):   138.72 MiB/s in 3.1s (aggregate)
+
+scaling: 1.41x at 2 jobs (70% efficiency)
+json: {"jobs": 2, "baseline_mibps": 98.491, "parallel_mibps": 138.724, "scaling": 1.408}

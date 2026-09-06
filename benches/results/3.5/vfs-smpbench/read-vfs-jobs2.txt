@@ -1,0 +1,3 @@
+json: {"jobs": 2, "mode": "read-vfs", "baseline_mibps": 1334.658, "parallel_mibps": 1336.670, "scaling": 1.002}
+json: {"jobs": 2, "mode": "read-vfs", "baseline_mibps": 1345.394, "parallel_mibps": 1469.775, "scaling": 1.092}
+json: {"jobs": 2, "mode": "read-vfs", "baseline_mibps": 1378.738, "parallel_mibps": 1320.276, "scaling": 0.958}

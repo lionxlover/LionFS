@@ -12,17 +12,330 @@ flowchart LR
     X1 --> V2["2.0.0 cross-platform architecture: PAL, io_uring, 128-bit addressing (462 tests)"]
     V2 --> V3["3.0.0 unlimited: eleven subsystems over the substrate (638 tests)"]
     V3 --> V31["3.1.0 wiring: seven seams on the live paths, crash simulator (713 tests)"]
+    V31 --> V32["3.2.0 data CoW, dedup wired, fast-append, latency percentiles (730 tests)"]
+    V32 --> V33["3.3.0 metadata CoW, O(1)-metadata snapshots, SMP read bench, fio framework (736 tests)"]
+    V33 --> V34["3.4.0 parallel write path, write-back intake, group commit (754 tests)"]
+    V34 --> V35["3.5.0 pipelined txg commit, lock-free readers, O(1)-total snapshots (760 tests)"]
 ```
 
 Test-suite growth per release (all green, with and without `io_uring`
 where applicable):
 
-$$N: 245 \to 462 \to 638 \to 713$$
+$$N: 245 \to 462 \to 638 \to 713 \to 730 \to 736 \to 754 \to 760$$
 
-— a cumulative factor of $713/245 \approx 2.9\times$ over the 1.x
+— a cumulative factor of $760/245 \approx 3.1\times$ over the 1.x
 line, with per-release deltas
 
-$$\Delta_k = N_k - N_{k-1}: \quad \Delta_{2.0} = 217, \quad \Delta_{3.0} = 176, \quad \Delta_{3.1} = 75$$
+$$\Delta_k = N_k - N_{k-1}: \quad \Delta_{2.0} = 217, \quad \Delta_{3.0} = 176, \quad \Delta_{3.1} = 75, \quad \Delta_{3.2} = 17$$
+
+## [3.6.0] — Phase 12: xattrs + POSIX ACLs, reflink, the wired self-heal scrub, crypto agility, and the Format Vault
+
+### Added
+- **Extended attributes + POSIX ACLs** (`specifications/xattrs_acl.md`):
+  a per-inode `XattrTree` (node type 13, frozen under snapshots,
+  rooted at `Superblock::xattr_tree_root` carved from `padding2`)
+  whose records point at self-describing "LXAT" blocks (magic +
+  version + fletcher32, TLV entries, 4 KiB per inode -- the ext4
+  shape). Full VFS surface: `getxattr/setxattr/listxattr/removexattr`
+  on `VfsOps` (default ENOSYS impls keep other implementors honest)
+  and the FUSE bridge (size-probe/ERANGE protocol, XATTR_CREATE /
+  XATTR_REPLACE). POSIX 1003.1e draft-17 ACLs
+  (`security::posix_acl`) in the ext4-compatible wire format under
+  `system.posix_acl_access/default`: structural validation, mode-bit
+  derivation, the full access-check algorithm (chmod re-maps class
+  entries), and mkdir default-ACL inheritance in the SAME
+  transaction as the directory's inode.
+- **Reflink clones** (`specifications/phase12_reflink.md`,
+  `fs::reflink`): `copy_file_range` on a whole-file, zero-offset,
+  empty-destination request shares the source's physical blocks and
+  pins them with the refcount coverage tree -- the dedup redirect
+  machinery makes both files writable with zero data copied
+  (Btrfs/APFS clone parity). The destination gets its OWN spill
+  extent tree; a `CloneRecord` lands in the clone registry (node
+  type 9, root-cell synced). `lfs_clone` is now a REAL tool
+  (`reflink|list|check`); the 3.5 binary printed success without
+  opening the device.
+- **The wired self-heal scrub** (`specifications/phase12_self_heal.md`):
+  the 3.3-3.5 scrubber was a placeholder thread that never read a
+  block. 3.6: enumerate every checksum-tree record, verify against
+  the record's OWN algorithm id, and on mismatch HEAL --
+  `healer::heal_block_in_place` reconstructs from parity (RAID5/6,
+  single-column, 4 KiB granularity) or a verifying mirror
+  (RAID1/10), accepts the reconstruction ONLY if it verifies against
+  the recorded checksum, and rewrites every device whose copy fails
+  (raw device I/O on purpose: idempotent, below the journal). No
+  redundancy -> the block is quarantined in the bad-block ledger
+  (which gained list/count/clear and a REAL health report). All
+  metadata bookkeeping rides the shared journal
+  (`SharedCore::stage_and_commit`) -- one writer per image, always.
+  Money test: real 3-device RAID5 pool, one flipped bit, read
+  refuses, sweep reconstructs from parity, application reads its
+  original bytes back.
+- **Crypto/format agility** (`specifications/crypto_agility.md`):
+  the write-path checksum is POLICY (`LFS_CSUM=xxh64|crc32c|sha256|
+  blake3`), stored per record (`ChecksumTreeValue.algorithm_id`,
+  which the read path always dispatched on) -- mixed-algorithm
+  images verify block-by-block and a volume can move to a stronger
+  digest without a reformat. The volume key envelope v2
+  (`EnvelopeV2`, magic "LFSE") carries `kdf_id`/`aead_id`/`kem_id`
+  agility fields and lives ON DISK at `Superblock::key_envelope_block`
+  (the 3.5 envelope had no on-disk home); `mkfs --passphrase` writes
+  it, the mount gate enforces it, and the KEM slot is the reserved
+  seam for post-quantum key wraps without reformat.
+- **The Format Vault** (`docs/rfc/LFS-RFC-005-format-vault.md`,
+  `specifications/format_vault.md`): the 200-year program. ZFS-style
+  FEATURE FLAGS: the format version stays 2 and capabilities are
+  bits in `fs_features` (`FS_FEATURE_XATTR|REFLINK|ENVELOPE_V2`);
+  the mount gate moved INTO the core (`LionFS::new` refuses unknown
+  bits -- previously only the CLI checked anything). An 11-check
+  conformance battery (`ondisk::conformance` + `lfs_conformance`)
+  verifies superblock integrity + slot agreement, geometry, tree
+  reachability, checksum spot-verification against on-disk bytes,
+  snapshot/clone/xattr registries, bitmap/free-block agreement, and
+  the journal tail. `lfs_upgrade` is REAL: conformance-gated offline
+  validation + feature-registry commit (the 3.5 binary printed ok
+  without touching the device).
+- **Snapshot send/recv** (`specifications/replication.md`,
+  `fs::replication`): `lfs_replicate send` serializes a snapshot's
+  FROZEN view into a portable, self-describing "LFSS" v1 stream
+  (every block verified against the snapshot's own frozen checksum
+  view as it is read; per-file SHA-256 + manifest digest);
+  `recv` replays it through the ordinary POSIX write path, verifies
+  every digest, and freezes the result as a snapshot on the target.
+- Telemetry: scrub counters (scanned/errors/repaired) join the
+  process-wide stats; the pattern is ready for the bridge.
+
+### Fixed (all pre-existing, found by the new money tests / battery)
+- **Corruption read as silent zeros**: `VfsOps::read` swallowed
+  checksum-mismatch and IO errors from the committed read (`.ok()`)
+  and returned a success code full of ZEROS. It now surfaces EIO
+  unless the page cache covers the whole range. The Phase 12 scrub
+  money test starts by proving the corruption is refused END TO END.
+- **Partial-tail-page flushes committed page-rounded sizes**: a
+  28-byte fsync'd file remounted as 4096 bytes (the drained run's
+  full page became `inode.size`). Flushes now commit
+  `max(pre-flush committed size, shadow EOF)` -- block-granular
+  storage, logical size.
+- **`sb.free_blocks` was static since mkfs**: allocations updated
+  the bitmap but never the superblock -- statfs free space was a
+  mkfs-time constant. `Transaction.alloc_delta` folds net
+  allocations/frees into the superblock at every commit; clean
+  unmount checkpoints the superblock; mkfs (and the test fixtures)
+  now subtract the reserved secondary slots so the bitmap and the
+  superblock AGREE (the conformance battery's bitmap check caught
+  this on every real image > 8192 blocks).
+- **First-use tree roots could be lost**: `commit_tx` skips slot
+  persistence when no root cell moved, so a tree initialized
+  (xattr/refcount/clone) inside a transaction whose B-tree never
+  split existed only in memory after a crash. First-use inits now
+  publish their roots through the transaction root cells -- the
+  same mechanism a root move uses.
+- **`write_all_slots` extended the image file**: slots at or beyond
+  `total_blocks` (exactly 16384 for a 16-KiB-block-count image) were
+  written past EOF. Guarded.
+- **xattr errno**: not-found is ENODATA per xattr(7), not ENOENT.
+- RAID5 geometry note (documented, fixture-aligned): the primary
+  superblock slot shares device-0 physical block 0 with row-0
+  parity, so metadata writes clobber it and the SECONDARY slots are
+  what mount reads back -- exactly the real mkfs layout.
+
+### Validation
+- 790/790 lib tests (762 baseline + 28 new), 794 with io_uring,
+  green in debug AND release. New money tests: xattr
+  roundtrip/persist/flags, ACL evaluation + chmod sync + mkdir
+  inheritance, reflink share/redirect/durability/registry, RAID5
+  bit-rot heal end to end, conformance battery on a populated
+  image, mount-gate refusal of unknown feature bits, send/recv
+  roundtrip with digest verification.
+
+## [3.5.0] — Phase 11: pipelined transaction groups + birth-generation snapshots
+
+### Added
+- **Pipelined txg commit**: a commit splits into a microsecond QUIESCE (under the staging lock: take the transaction, push it into the pending list as `Arc<Transaction>`, seqlock odd) and an I/O phase (journal + syncs + apply + root cells — no staging lock). Writers stage the next group and readers read while a group is in flight; the quiesced group's blocks stay readable through the pending-overlay chain in `TxContext::read_block` (the lost-update guard).
+- **Adaptive group driving** (`commit_until_covered`): an fsync with no commit in flight drives its own group immediately (zero thread-handoff latency); a waiter overlapping an in-flight group waits for the driver's next group — concurrent fsyncs coalesce. Racing self-drives are safe (the quiesce lock hands the transaction to exactly one driver).
+- **Background committer thread** (`lfs-committer`, `LFS_ASYNC_COMMIT=0` disables): drains staging no fsync drives (metadata ops, threshold flushes) on a 20 ms poll; deliberately never on the fsync critical path.
+- **Lock-free readers**: `tx_present` atomic probe replaces the staging-lock probe; the scratch read is a seqlock + pending-count fast path with retry-on-commit-boundary; `get_inode`'s miss path uses it. Readers never take the staging lock unless a transaction is actually in flight.
+- **O(1) total snapshot creation (birth generations)**: on checksummed images (mkfs default) `create_snapshot` records the roots and NOTHING else — the 3.2-3.4 pin walk is gone. Data protection derives from the per-block birth stamps the write path records in the checksum tree's `generation` field: overwrite redirects iff birth <= barrier; truncate retains iff birth <= barrier; delete reclaims old-phys blocks whose birth > the remaining snapshots' max barrier (conservative; GC sweeps residue). Pin-mode fallback (checksums off) keeps the 3.3 walk — per-image, flagged per snapshot record (`SNAPSHOT_FLAG_BIRTH`).
+- `node_gen_stamp()` public stamp API; `TxContext::with_pending` / `effective_cow_barrier`.
+- `src/fs/phase11_tests.rs`: six money tests (pipelined durability across destroy+remount with per-page integrity markers; no torn reads during concurrent pipeline writes; O(1) creation with 200 extent runs -> 1 allocation; birth redirect for pre-snapshot writes + in-place for post-snapshot appends; truncate-retains + delete-reclaims; pin-mode fallback).
+- `benchmarks/run-phase11-measurements.sh`; results archived under `benches/results/3.5/` (medians of 3, environment, raw JSON lines).
+- `specifications/phase11_txg_birth.md` (design record with the three-design A/B history and honest limits).
+
+### Fixed
+- `LFS_ASYNC_COMMIT=0` escape hatch: the wait-first policy stalled fsync ~500 ms per call with no committer to wake it — waiters now self-drive when no commit is in flight (also removes the 20-43% single-stream handoff cost the naive wait-first variant paid on 2 vCPU).
+- **Journal-wrap recovery tore filesystems** (pre-existing since the first journal): a wrapped journal holds a non-contiguous transaction set; replaying the old ones stamped stale tree nodes over the live tree (whole pages as zeros, frankenstate remounts). Recovery now replays only the contiguous-id suffix — the WAL prefix property. Regression: `recovery::journal_wrap_tests` (2 money tests).
+- **Superblock slots collided with data** (pre-existing): the slot blocks 8192/16384 were never reserved in the bitmap; `write_all_slots` could stamp the superblock over an allocated file/tree block. mkfs (tool and test fixture) now reserves every in-range slot.
+- **Test-fixture journal region was allocatable**: the parallel-test `mkfs_image` pointed `data_region_start` at the journal start (the real mkfs correctly points after the journal), so file data and journal fought over blocks 66..4162 — the source of the "live zero pages" flake cluster. Fixed to match the real layout.
+- **False group coverage** (3.5): the 3.4 epoch-mark reasoning broke once `commit_end` incremented after the I/O — an fsync could return COVERED with its bytes still uncommitted. Waiters now track their own transaction's retirement (`tx_live`).
+- **Out-of-order applies** (3.5, the deepest): quiescing second but acquiring the I/O lock first let the EARLIER group's apply stamp older block versions over newer ones — live lost updates (a flush-oracle debug_assert, kept as a permanent tripwire, caught a create-era inode re-materializing). `commit_io` now covers the quiesce: quiesce order == apply order, staging still overlaps I/O.
+- **Commit errors were swallowed**: `commit_tx` ignored journal/apply failures and retired the group as consistent — a half-applied group (device error) published valid tree state pointing at never-written data. Errors now hold the group pending (the WAL is durable; recovery completes or discards) and are surfaced.
+- `snapshot_write_isolation` (3.2 money test) now asserts the birth-mode contract (no pins; protection via csum birth <= barrier) instead of the pin-walk mechanism.
+
+### Measured (2-vCPU container, release, medians of 3, `benches/results/3.5/`)
+- Buffered write intake: 2982 -> 4123 MiB/s at 2 jobs (**1.38x**, intact).
+- Durable write (fsync per 1 MiB): 480 MiB/s at 1 job (parity with the 3.4 architecture measured same-day: 473) and 479 at 2 jobs — flat at the container's sync ceiling with no degradation; the 3.4 architecture degraded to 0.71x at 64-KiB fsync cadence.
+- Vfs reads: 1390 MiB/s at 1 job; 2-job scaling now matches the disk layer's own (readers add no contention beyond the storage path).
+- Snapshot creation: **0.015 ms** birth-mode (was 0.14 ms at 7 extent runs in 3.3; O(1) in runs — 200 runs cost 1 allocation in the money test).
+- Under-snapshot steady rewrite: 961 MiB/s (5.7x the 3.3 run's absolute number; ~15% tax vs this run's base; first CoW pass 380 MiB/s, 2.3x).
+- Validation: 762/762 lib (debug + release, repeatedly), 766 io_uring, 1 proptest, clippy 38 (baseline), simulator determinism + all crash-invariant tests green; ~100 full-suite/fs-module iterations during the five-bug hunt, including a re-measured 3.4 baseline (25/25 clean) to prove the residual flake was a 3.5 regression before root-causing it.
+
+## [3.4.0] — Phase 10: parallel write path
+
+### Added
+- `VfsOps` operations surface is `&self` (init/destroy stay `&mut`): bridges and library consumers drive N threads through ONE mount. `LionFS` splits into a lock-disciplined `SharedCore` (staging lock, superblock `RwLock` with `Copy` snapshots, key-manager mutex) plus the mount-lifecycle shell.
+- Write-back intake page cache (`src/fs/page_cache.rs`): per-inode write gates, plaintext 4-KiB pages, shadow size/mtime, read-through RMW fetch, 32-MiB dirty threshold with gate-aware lazy flush. `LFS_WRITEBACK=0` restores 3.3 write-through (A/B lever).
+- Group commit: `commit_end` epoch + `commit_until_covered` — concurrent fsyncs share one journal run + device sync set (WAFL/PostgreSQL protocol).
+- Commit-window seqlock (`commit_seq`): lock-free readers retry on overlap with a commit's block-by-block apply, so a half-applied tree can never be observed (unreachable in 3.3 only because `&mut self` made everything single-threaded).
+- `lfs_smpbench --write buffered|durable [--fsync-every KiB]` and `--read-vfs`: measured SMP through the real `VfsOps` path.
+- `src/fs/parallel_tests.rs`: 11 money tests on real images (4-thread concurrent writers, same-file interleave, partial-block RMW, fsync-durable vs unflushed-lost, destroy barrier, shadow size, truncate-after-buffered, unlink-drops-pages, readers-vs-writer overlap, compressed write-through, sequential e2e) + 7 page-cache unit tests.
+- `specifications/phase10_write_concurrency.md` (design record: contract table, lock-order discipline, measured table, honest limits).
+- Container fio reference: real fio 3.36 built from source; `benchmarks/run-container-reference.sh` archives the overlay-FS legs, the vfs SMP numbers, and the harness suite under `benches/results/3.4/`.
+
+### Fixed
+- Commit no longer releases the staging lock before running: readers could previously race the journal apply window (torn tree reads) once reads became concurrent — the window was unreachable in 3.3's single-threaded mount.
+- Dirty-byte accounting counts a resident page once, not once per overwrite (threshold flush storms on rotating-overwrite workloads).
+- Page-cache threshold flush is gate-aware (try-lock for foreign inodes): no self-deadlock on the actively-written file, no cross-gate deadlock between two flushing writers.
+
+### Measured (2-vCPU container, release, `benches/results/3.4/`)
+- Buffered write intake: 3036 -> 4292 MiB/s at 2 jobs (**1.41x**).
+- Durable write (fsync per 1 MiB): ~512 MiB/s, flat across jobs (staging-bound by design).
+- Vfs read: 1455 -> 1608 MiB/s (1.11x); disk-layer read 0.93x.
+- fio 3.36 overlay reference: seq-64k w 731 / r 693 MiB/s; rand-4k r 13.7 / w 637 (buffered) MiB/s.
+- Simulator: determinism PROVEN (seed 9927); 60 crash points ALL invariants held.
+
+## [3.3.0] - The Metadata-CoW Release (Phase 9)
+
+### Added
+- **Metadata path-copy CoW** (`specifications/phase9_metadata_cow.md`):
+  node-write stamps + snapshot barriers + path-copy in the B-tree
+  mutation paths. Frozen trees: inode, dir-name, spill-extent,
+  checksum. Snapshot creation is O(1) in metadata (records current
+  roots; the 3.2 deep copy is removed); data stays O(extent runs).
+- **Frozen checksum views**: snapshot reads can now VERIFY data —
+  `SnapshotManager::read_snapshot_csum` and `lfs_snapshot verify`
+  (3.2 snapshot reads had to disable verification).
+- **Frozen dir-name views**: `read_snapshot_dir_entry` resolves names
+  as of the snapshot; post-snapshot names do not exist in the view.
+- **`lfs_snapshot` became a real tool**: create/delete/list/verify
+  through the actual SnapshotManager + journal + superblock slot
+  persistence. It was previously a placeholder that printed success
+  without touching the device.
+- **`lfs_smpbench`**: measured SMP read scaling — N scoped worker
+  threads over one shared `Arc<Disk>` (positioned pread), private
+  transaction contexts, shared node cache, interleaved
+  baseline-vs-parallel in one process. Measured 1.26x at 2 jobs
+  (shared cache) / 1.41x (no cache) on the development container.
+  Writes are single-writer per mount and are NOT benchmarked (Phase 10
+  gap, stated in the tool's own output).
+- **`lfs_ioperf --snapshot-tax`**: the measured write tax of a live
+  snapshot — ~9% first pass (data redirects + one-time metadata
+  path-copies), ~6% steady state (redirects only); creation 0.14 ms
+  for a 7-run 32 MiB file.
+- **`benchmarks/fio/`**: the mounted-filesystem comparison framework —
+  identical fio jobs against ext4/XFS/Btrfs/ZFS/LionFS-FUSE on one
+  device, medians over runs, `summary.md` on your hardware. Ships zero
+  numbers by design.
+- `Superblock.node_generation` (stamp high-water, persisted at commits
+  that move roots; carved from padding, read/write compatible with
+  older images) and multi-slot superblock persistence
+  (`ondisk::superblock::write_all_slots`).
+
+### Changed
+- B-tree root relocation is now first-class: root cells (per
+  transaction) + a per-Disk frozen-roots mirror make every reader —
+  including bare-context writers like tools and tests — find the live
+  root between a CoW move and the superblock sync at commit.
+  Snapshot views opt OUT via `BTree::new_frozen` (recorded roots are
+  honored verbatim; chasing the live root would read post-snapshot
+  state into a "frozen" view).
+- `BTree::remove` gained `remove_with_alloc` for frozen trees under a
+  live barrier; the spill-tree truncate/remap paths in
+  `file::writer` use it (a plain `remove` on a frozen tree under a
+  barrier now returns an error instead of silently mutating a frozen
+  view).
+- `iter_all` walks internal child pointers instead of the `next_leaf`
+  sibling chain: under CoW a copied leaf is reachable only through the
+  repointed parent (the old chain threads the frozen originals).
+- `delete_snapshot` recomputes the barrier as the max stamp over the
+  REMAINING live snapshots (lowering it un-freezes only what the
+  deleted snapshot alone could reach).
+- `mkfs_lfs` initializes the snapshot registry tree (reserved root
+  block 18), so `lfs_snapshot create` works on a fresh format.
+
+### Fixed
+- **Flaky dedup-gate race** (latent since 3.2): two parallel tests
+  sharing the process-global dedup flag could race one teardown's
+  reset against the other's mid-write probe; the gate is now
+  guard-counted so concurrent guarded users are independent
+  (observed once in the 3.3 full run, root-caused, fixed).
+
+### Tested
+- 736 lib tests (730 baseline + 6 new metadata-CoW money tests:
+  inode-view freeze through a bare context, copy-once-per-epoch,
+  barrier recompute on delete, checksum/dir freeze, fast-append/CoW
+  interaction) + 1 proptest + io_uring suite.
+
+## [3.2.0] - The Data-Path CoW + Gap-Closure Release
+
+The honest gaps 3.1's own documentation listed — "CoW: infrastructure
+exists, write path does not use it", "dedup: tree exists, not wired",
+"no latency numbers exist in this repository", "the checksum insert is
+~45% of write cost" — are closed or attacked in this release.
+
+### Fixed (correctness, the headline)
+
+- **Snapshots actually snapshot now.** `create_snapshot` pinned
+  nothing and the write path modified blocks in place: a snapshot's
+  read view silently mutated under it (the code comments admitted
+  this). 3.2 pins every inode extent run in a refcount COVERAGE tree
+  (`integrity::refcount`, rewritten as disjoint runs with
+  split-at-boundary pin/unpin), redirects writes that hit pinned
+  blocks (`file::writer` CoW branch + extent remap), deep-copies the
+  inode tree into the snapshot record, and unpins exactly on snapshot
+  delete. Money test: `fs::cow_tests::snapshot_write_isolation`.
+- **Truncate no longer frees pinned blocks** (deferred to pin release
+  / GC — the lazy-free shape Btrfs uses for shared extents).
+
+### Added
+
+- **Deduplication wired** (`specifications/dedup.md`): BLAKE3 content
+  hash index (existed since 3.0) now probed by fresh full-block
+  cipher-inactive writes; verify-on-share (re-read + re-hash before
+  sharing — stale index entries degrade to fresh writes, never to
+  wrong shares); shared blocks pinned in the coverage tree so either
+  sharer's overwrite CoWs. Off by default: `LFS_DEDUP=1` (ZFS's own
+  posture). Coverage vs. ZFS: **6/6** (`docs/comparison.md`).
+- **Latency percentiles in `lfs_ioperf`** (p50/p99/p999, nearest-rank,
+  per-call, steady-state loops): the "no latency measurement exists in
+  this repository" claim is retired. First measured tail shape:
+  p999/p50 ≈ 6.7x on seq4k-write.
+- **B-tree fast-append cache**: monotone inserts append to the
+  rightmost leaf in one read + one write (epoch-guarded, revalidated,
+  fail-safe to the full descent). Checksum-tree handles now live for
+  the whole `write_file` call, so per-block inserts share the cache —
+  this is the 45%-of-write-cost insert path.
+- **GF(256) cached 256x256 table set** (64 KiB, built once per
+  process — the old code rebuilt a 256-entry table per call: 256 field
+  multiplications per 4 KiB block) + 8-way unrolled
+  multiply-accumulate.
+- `FileManager::resolve_public_block` diagnostics helper;
+  `specifications/dedup.md`; snapshot spec implementation-status
+  section.
+
+### Changed
+
+- `write_file`/`truncate_file` signatures carry `refcount_tree_root`
+  (+ `dedupe_tree_root` on `write_file`) — call sites updated across
+  the crate, tools, and tests.
+- `read_node` serves dirty-in-this-tx nodes from the dirty map
+  without re-verifying their write-time CRCs.
+- `lfs_ioperf` tables gain p50/p99/p999 columns (text + JSON).
+
+### Measured (harness, cross-session — directional, not interleaved)
+
+seq4k-write 1033 -> 1255 MiB/s; seq64k-write-fresh 832 -> 1107
+MiB/s; raw outputs in `benches/results/3.2/`. Reads improved too but
+reads do not take the insert path — attributed to drift, not claimed.
 
 ## [3.1.0] - The Phase 8 Wiring Release
 

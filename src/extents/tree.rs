@@ -82,6 +82,23 @@ impl ExtentTree {
         self.btree.remove(ctx, logical_start)
     }
 
+    /// Phase 9: remove with an allocator, for use while a snapshot
+    /// barrier is live -- the spill tree is a FROZEN tree (its root is
+    /// recorded inside the inode the snapshot froze), so a removal may
+    /// need to path-copy nodes first. `truncate_file`'s remap/trim
+    /// paths must use this variant.
+    pub fn remove_with_alloc<F>(
+        &mut self,
+        ctx: &mut TxContext,
+        logical_start: &u64,
+        allocate_block: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(&mut TxContext) -> Result<u64>,
+    {
+        self.btree.remove_with_alloc(ctx, logical_start, allocate_block)
+    }
+
     /// Iterate every spilled extent in logical order. Used by truncate
     /// and free paths that must visit every extent. O(n) reads.
     pub fn iter_extents(&self, ctx: &mut TxContext) -> Result<Vec<(u64, ExtentTreeValue)>> {

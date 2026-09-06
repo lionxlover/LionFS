@@ -49,6 +49,32 @@ variable-length physical extents -- compression actually saves space
 (ratio 2.90x on a mixed corpus) instead of padding each compressed
 block back to 4 KiB. Level is a mount option.
 
+## 3.3: the measured cost of snapshot safety (metadata CoW)
+
+CoW is not free, and 3.3 measured what it costs in this codebase
+(`lfs_ioperf --snapshot-tax`, in-process harness, 2-vCPU container):
+
+$$
+T_{\text{first-pass}} = T_{\text{base}} + C_{\text{redirect}} + C_{\text{path-copy}},
+\qquad T_{\text{steady}} = T_{\text{base}} + C_{\text{redirect}}
+$$
+
+| phase | MiB/s | tax vs base |
+|---|---|---|
+| fresh write, no snapshot | 178.5 | -- |
+| first rewrite under snapshot | 163.0 | ~9% ($C_{\text{redirect}} + C_{\text{path-copy}}$, copies once per epoch) |
+| steady rewrite under snapshot | 168.6 | ~6% ($C_{\text{redirect}}$ only) |
+
+The metadata copy term is transient by construction: every node is
+path-copied at most once per snapshot epoch (stamp above barrier), so
+the first-pass tax decays into the steady tax. Snapshot creation:
+0.14 ms for a 7-run 32 MiB file (O(extent runs) pin walk; the metadata
+side is O(1) since the 3.2 deep-copy was removed).
+
+SMP reads (same environment, `lfs_smpbench`): 1.26x at 2 jobs with the
+shared node cache, 1.41x without it -- the cache is the contention
+point; writes remain single-writer per mount (Phase 10).
+
 ## What is deliberately NOT claimed
 
 - Readahead: the Markov predictor is wired but measured negative
@@ -125,3 +151,71 @@ threaded floor on the same host -- README and
 `specifications/io_engine.md`; the shared 2-vCPU container bounds the
 absolute values, the $\approx 6.1\times$ ratio is the $p/N$
 signature.
+
+
+## 3.4: The write path splits into intake and staging
+
+Phase 10 splits what used to be one serialized operation into a
+parallel intake (write-back page cache) and a serialized staging /
+commit pipeline, behind a `&self` operations surface. The cost model
+gains two terms instead of one. Intake cost per byte is a page copy
+plus map operations (microseconds per 4 KiB, memory-bound), so its
+throughput scales with threads up to memory bandwidth. Staging cost
+per byte -- checksums, B-tree inserts, journal records, allocator --
+is serialized under the staging lock, and each commit pays a fixed $C$
+(journal write + two device syncs + apply). With fsync batch size $B$:
+
+$$T_{\text{durable}} \approx \frac{B}{c_s B + C} = \frac{1}{c_s + C/B}$$
+
+The 3.4 measurements pin the constants on this container: 512 MiB/s
+durable at $B = 1$ MiB, which implies $c_s \approx 1.9\ \mu
+s/\mathrm{KiB}$ of serialized staging plus $C/B \approx 2\ \mu
+s/\mathrm{KiB}$ of commit overhead, consistent with the 3.1 harness
+figure (832 MiB/s at the 4-MiB commit threshold -- the same pipeline
+with $C/B$ halved). The group-commit wait makes $k$ concurrent
+fsyncs behave as one $B' = kB$ batch:
+
+$$T_{\text{group}}(k) \approx \frac{kB}{c_s kB + C} \xrightarrow{k \to \infty} \frac{1}{c_s}$$
+
+which is why measured durable scaling is flat (0.98x at 2 jobs) rather
+than negative: the serialized section does the necessary work exactly
+once per batch. Buffered intake scaling follows the usual
+lock-contention shape
+
+$$S_{\text{intake}}(N) = \frac{N\,T_1}{T_1 + (N-1)\,\ell_{\text{map}}}$$
+
+measured 1.41x at $N = 2$ on two vCPUs. The read path's lock-free
+seqlock (readers retry only when a commit's apply window overlaps
+their read) keeps the no-writer read path free of the staging lock
+entirely: 1608 MiB/s aggregate at 2 jobs through the full vfs surface.
+Design record with the lock-order discipline and the honest limits:
+`specifications/phase10_write_concurrency.md`.
+
+## 3.5: The commit pipeline and the snapshot creation constant
+
+The 3.4 write path released the staging lock only after the whole
+commit; 3.5 releases it after a microsecond quiesce. Three structural
+results, measured (medians of 3, `benches/results/3.5/`):
+
+1. **fsync latency stays at parity while the lock discipline changed.**
+   Durable 1-job: 456 MiB/s vs 473 for the 3.4 architecture measured
+   the same day (within run-to-run noise). The adaptive self-drive
+   policy costs nothing; the final numbers include the
+   commit-ordering fix that serializes commits fully (the honest cost
+   of quiesce order == apply order — the bug it fixes is in the design
+   record's hunt section).
+2. **Staging and reading overlap a commit's I/O.** The quiesced group
+   stays readable through pending overlays (`TxContext::read_block`),
+   so the mount's other threads proceed while the journal + syncs +
+   apply run. The money tests prove the semantics (pipelined
+   durability across remount; no torn reads during concurrent
+   pipeline writes); the buffered-intake scaling (1.38x at 2 jobs) is
+   intact.
+3. **Snapshot creation is O(1) total on checksummed images.** The
+   birth generations recorded in the checksum tree replace the pin
+   walk: creation 0.015 ms at 7 live extent runs (0.14 ms in 3.3 at
+   the same shape), and the money test shows 200 extent runs costing
+   ONE allocation. The trade: rewrites under a live snapshot pay one
+   csum-tree lookup per overwritten block (first CoW pass 380 MiB/s,
+   steady state 961 MiB/s vs 728 base in that run — a ~15% steady
+   tax, zero tax with no snapshots).

@@ -91,6 +91,14 @@ impl fmt::Display for VfsError {
 
 impl std::error::Error for VfsError {}
 
+/// 3.6: bridge a VFS error into the io::Error world (replication,
+/// tools) preserving the errno.
+impl From<VfsError> for std::io::Error {
+    fn from(e: VfsError) -> Self {
+        std::io::Error::from_raw_os_error(e.errno)
+    }
+}
+
 pub type VfsResult<T> = Result<T, VfsError>;
 
 /// File kind (platform-neutral; the bridge maps to fuser::FileType /
@@ -180,41 +188,94 @@ pub struct VfsCreate {
 
 /// The operations surface. One method per FUSE ABI entry point (plus
 /// `init`/`destroy`); bridges translate, nothing more.
+///
+/// Phase 10: every operation except mount-lifecycle `init`/`destroy`
+/// takes `&self` -- the implementor must be internally synchronized.
+/// This is what lets a bridge (or a library consumer, or the Rust/C
+/// API) drive N threads through ONE mounted filesystem: reads run
+/// concurrently, buffered writes land in the write-back intake layer
+/// concurrently, and metadata staging serializes on the implementor's
+/// staging lock (the exact journaling-FS model). A `&mut self`
+/// surface would force every bridge to hold one giant mutex, which is
+/// the single-writer mount model 3.3 shipped and this release retires.
 pub trait VfsOps {
     /// Mount-time initialization (start workers, scrubbers).
     fn init(&mut self);
     /// Unmount-time teardown (sync, stop workers).
     fn destroy(&mut self);
 
-    fn lookup(&mut self, parent: u64, name: &str) -> VfsResult<VfsAttr>;
-    fn getattr(&mut self, ino: u64) -> VfsResult<VfsAttr>;
-    fn setattr(&mut self, ino: u64, attr: &VfsSetAttr) -> VfsResult<VfsAttr>;
-    fn readdir(&mut self, ino: u64, offset: u64, max_entries: usize)
+    fn lookup(&self, parent: u64, name: &str) -> VfsResult<VfsAttr>;
+    fn getattr(&self, ino: u64) -> VfsResult<VfsAttr>;
+    fn setattr(&self, ino: u64, attr: &VfsSetAttr) -> VfsResult<VfsAttr>;
+    fn readdir(&self, ino: u64, offset: u64, max_entries: usize)
         -> VfsResult<Vec<VfsDirEntry>>;
-    fn read(&mut self, ino: u64, offset: u64, size: u32) -> VfsResult<Vec<u8>>;
-    fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> VfsResult<u32>;
-    fn create(&mut self, parent: u64, name: &str, create: &VfsCreate) -> VfsResult<VfsAttr>;
-    fn mkdir(&mut self, parent: u64, name: &str, create: &VfsCreate) -> VfsResult<VfsAttr>;
-    fn unlink(&mut self, parent: u64, name: &str) -> VfsResult<()>;
-    fn rmdir(&mut self, parent: u64, name: &str) -> VfsResult<()>;
-    fn rename(&mut self, parent: u64, name: &str, newparent: u64, newname: &str) -> VfsResult<()>;
-    fn fsync(&mut self, ino: u64, datasync: bool) -> VfsResult<()>;
+    fn read(&self, ino: u64, offset: u64, size: u32) -> VfsResult<Vec<u8>>;
+    fn write(&self, ino: u64, offset: u64, data: &[u8]) -> VfsResult<u32>;
+    fn create(&self, parent: u64, name: &str, create: &VfsCreate) -> VfsResult<VfsAttr>;
+    fn mkdir(&self, parent: u64, name: &str, create: &VfsCreate) -> VfsResult<VfsAttr>;
+    fn unlink(&self, parent: u64, name: &str) -> VfsResult<()>;
+    fn rmdir(&self, parent: u64, name: &str) -> VfsResult<()>;
+    fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> VfsResult<()>;
+    fn fsync(&self, ino: u64, datasync: bool) -> VfsResult<()>;
     /// Flush at file close (the FUSE flush entry).
-    fn flush(&mut self, ino: u64) -> VfsResult<()>;
-    fn statfs(&mut self, ino: u64) -> VfsResult<VfsStatFs>;
+    fn flush(&self, ino: u64) -> VfsResult<()>;
+    fn statfs(&self, ino: u64) -> VfsResult<VfsStatFs>;
     /// access(2): uid/gid are the *caller's*.
-    fn access(&mut self, ino: u64, uid: u32, gid: u32, mask: i32) -> VfsResult<()>;
+    fn access(&self, ino: u64, uid: u32, gid: u32, mask: i32) -> VfsResult<()>;
     /// Read a symlink target (Symlink inodes only).
-    fn readlink(&mut self, ino: u64) -> VfsResult<String>;
+    fn readlink(&self, ino: u64) -> VfsResult<String>;
     /// Create a symlink `name` in `parent` pointing at `target`.
     fn symlink(
-        &mut self,
+        &self,
         parent: u64,
         name: &str,
         target: &str,
         uid: u32,
         gid: u32,
     ) -> VfsResult<VfsAttr>;
+
+    // -- 3.6: extended attributes, POSIX ACLs, reflink ------------------
+    //
+    // Default implementations return ENOSYS so existing VfsOps
+    // implementors (test mocks, library embedders) keep compiling and
+    // bridges advertise the capability honestly until implemented.
+
+    /// getxattr(2): read one extended attribute. `Ok(None)` = the
+    /// attribute does not exist (ENOATTR/ENODATA for the caller).
+    fn getxattr(&self, _ino: u64, _name: &str) -> VfsResult<Option<Vec<u8>>> {
+        Err(VfsError::nosys())
+    }
+    /// setxattr(2): create/replace one extended attribute. `flags`
+    /// carries the Linux XATTR_CREATE (0x1) / XATTR_REPLACE (0x2) bits.
+    fn setxattr(&self, _ino: u64, _name: &str, _value: &[u8], _flags: i32) -> VfsResult<()> {
+        Err(VfsError::nosys())
+    }
+    /// listxattr(2): every attribute name on the inode.
+    fn listxattr(&self, _ino: u64) -> VfsResult<Vec<String>> {
+        Err(VfsError::nosys())
+    }
+    /// removexattr(2): delete one extended attribute.
+    fn removexattr(&self, _ino: u64, _name: &str) -> VfsResult<()> {
+        Err(VfsError::nosys())
+    }
+    /// copy_file_range(2): copy (or, when the engine can, REFLINK) a
+    /// range from `ino_in` to `ino_out`. Returns the number of bytes
+    /// actually copied. A whole-file, zero-offset, empty-destination
+    /// request on a checksummed image takes the shared-extent reflink
+    /// path (Btrfs/APFS clone parity); anything else is an honest
+    /// byte copy.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        _ino_in: u64,
+        _offset_in: u64,
+        _ino_out: u64,
+        _offset_out: u64,
+        _len: u64,
+    ) -> VfsResult<u64> {
+        Err(VfsError::nosys())
+    }
+
     /// Time-to-live for positive/negative dentries (bridges feed this to
     /// the kernel to keep RCU path caching effective).
     fn entry_ttl(&self) -> Duration {

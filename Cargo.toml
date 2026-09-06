@@ -1,6 +1,6 @@
 [package]
 name = "lionfs"
-version = "3.1.0"
+version = "3.6.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Lion"]
@@ -85,8 +85,16 @@ name = "lfs_stress"
 path = "tools/stress/main.rs"
 
 [[bin]]
+name = "lfs_conformance"
+path = "tools/conformance/main.rs"
+
+[[bin]]
 name = "lfs_snapshot"
 path = "tools/snapshot/main.rs"
+
+[[bin]]
+name = "lfs_smpbench"
+path = "tools/smpbench/main.rs"
 
 [[bin]]
 name = "lfs_clone"

@@ -1,0 +1,1 @@
+json: {"jobs": 1, "baseline_mibps": 1743.406, "parallel_mibps": 1718.607, "scaling": 0.986}
