@@ -1,0 +1,128 @@
+/* ==========================================================================
+   LionFS — responsive.css
+   Breakpoints: 1200 / 1024 / 860 / 640 / 480. Mobile-first fixes only
+   (the base styles are desktop-first; this file re-flows them).
+   ========================================================================== */
+
+/* ---------- ≤ 1200px: re-flow bento to 6 tracks, tighten grids ---------- */
+@media (max-width: 1200px) {
+  .bento { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .tile.span-3, .tile.span-4 { grid-column: span 3; }
+  .tile.span-6, .tile.span-8 { grid-column: span 6; }
+}
+
+/* Long-code-token safety (mono paths, feature flags) */
+.tile p, .doc-card p, .arch-chip, .route-card p, .wstep p,
+.rel-card p, .g-card p, .section-lead, .honesty p { overflow-wrap: break-word; }
+
+/* ---------- ≤ 1024px: hide desktop nav links, show hamburger ---------- */
+@media (max-width: 1024px) {
+  .nav-links { display: none; }
+  .hamburger { display: flex; }
+  .hero-grid { grid-template-columns: 1fr; }
+  .hero-lead { max-width: 640px; }
+  .hero-stats { width: 100%; grid-template-columns: repeat(4, 1fr); }
+  .arch-wrap { grid-template-columns: 1fr; }
+  .arch-detail { position: static; min-height: 0; }
+  .guardian-wrap { grid-template-columns: 1fr; }
+  .kpi-row { grid-template-columns: repeat(2, 1fr); }
+  .footer-grid { grid-template-columns: 1fr 1fr; }
+  .footer-brand { grid-column: 1 / -1; }
+  .pillars-grid { grid-template-columns: repeat(2, 1fr); }
+  .pillar { grid-column: span 1; }
+  .pillar:last-child { grid-column: 1 / -1; }
+}
+
+/* ---------- ≤ 860px: stack two-column layouts ---------- */
+@media (max-width: 860px) {
+  :root { --section-pad: clamp(56px, 9vh, 84px); }
+  .tile.span-3, .tile.span-4, .tile.span-6, .tile.span-8 { grid-column: span 12; }
+  .bento { gap: 12px; }
+  .cantdo { grid-template-columns: 1fr; }
+  .route-split { grid-template-columns: 1fr; }
+  .hero-stats { grid-template-columns: repeat(2, 1fr); }
+  .stat .v { font-size: 1.35rem; }
+  .honesty { grid-template-columns: 1fr; text-align: left; }
+  .honesty-chips { align-items: flex-start; flex-direction: row; flex-wrap: wrap; }
+  .honesty-icon { width: 46px; height: 46px; }
+  .honesty-icon svg { width: 22px; height: 22px; }
+  .term-chip { display: none; }
+  .bar-cell { grid-template-columns: 54px 1fr 74px; gap: 8px; }
+  .bench-row .br-head { flex-direction: column; gap: 4px; }
+}
+
+/* ---------- ≤ 640px: phone refinements ---------- */
+@media (max-width: 640px) {
+  .hero { padding-top: calc(var(--nav-h) + 34px); }
+  .hero h1 { font-size: clamp(2rem, 9.5vw, 2.6rem); }
+  .hero-ctas .btn { flex: 1 1 auto; justify-content: center; }
+  .hero-stats { gap: 16px; padding-top: 20px; }
+  .hero-badge { font-size: 0.68rem; }
+  .term-body { font-size: 0.72rem; min-height: 240px; padding: 14px 14px 16px; }
+
+  .kpi-row { grid-template-columns: 1fr; }
+  .pillars-grid { grid-template-columns: 1fr; }
+  .pillar:last-child { grid-column: auto; }
+
+  .section-head { margin-bottom: 30px; }
+
+  .tabs { width: 100%; }
+  .tab { flex: 1; text-align: center; padding: 9px 10px; font-size: 0.8rem; }
+
+  .rel { padding-left: 34px; }
+  .rel-badge { display: none; }
+  .rel-bar { width: 90px; }
+
+  .wstep { grid-template-columns: 40px 1fr; gap: 12px; }
+  .wstep .node { width: 40px; height: 40px; border-radius: 11px; }
+  .wstep .node svg { width: 17px; height: 17px; }
+  .wpath-rail { left: 19px; }
+  .wstep .body { padding: 13px 15px; }
+
+  .qstep { grid-template-columns: 44px 1fr; gap: 14px; }
+  .qstep .n { width: 44px; height: 44px; font-size: 0.95rem; }
+  .qstep::before { left: 21px; top: 48px; }
+
+  .tools-bar { flex-direction: column; align-items: stretch; }
+  .search-box { max-width: none; }
+  .tools-grid { grid-template-columns: 1fr; }
+
+  .footer-grid { grid-template-columns: 1fr; gap: 30px; }
+  .footer-bottom { flex-direction: column; align-items: flex-start; }
+  .footer-bottom .right { text-align: left; }
+
+  .cta-actions .btn { width: 100%; justify-content: center; }
+  .cta-box .cta-cmd { font-size: 0.74rem; padding: 10px 14px; overflow-x: auto; max-width: 100%; }
+
+  .nav-gh span.gh-label { display: none; }
+  .brand-ver { display: none; }
+  .arch-detail { padding: 20px; }
+  .arch-detail h3 { font-size: 1.2rem; }
+  .pull-quote { font-size: 0.84rem; }
+}
+
+/* ---------- ≤ 480px: very small phones ---------- */
+@media (max-width: 480px) {
+  .hero-stats { grid-template-columns: repeat(2, 1fr); }
+  .brand-name { font-size: 1.05rem; }
+  .brand-mark { width: 30px; height: 30px; }
+  .fblock { display: none; }
+  .ticker-item { font-size: 0.64rem; }
+  .tools-chips { justify-content: flex-start; }
+}
+
+/* ---------- Touch devices: disable hover-lifts for sticky fingers ---------- */
+@media (hover: none) {
+  .pillar:hover, .tile:hover, .kpi:hover, .doc-card:hover, .tool:hover { transform: none; }
+  .wstep:hover .body, .g-card:hover, .rel-card:hover { transform: none; }
+}
+
+/* ---------- Print: clean paper output ---------- */
+@media print {
+  .site-header, .scroll-progress, .back-to-top, .hero-orbs, .hero-blocks,
+  .nav-drawer, .drawer-backdrop, .ticker, .radar, .term-chip { display: none !important; }
+  body { background: #fff; color: #111; }
+  .section { padding-block: 20px; }
+  [data-reveal] { opacity: 1 !important; transform: none !important; }
+  .bar-fill { transition: none; }
+}
