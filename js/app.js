@@ -5,11 +5,6 @@
    tabs, filters, copy buttons, mobile drawer, back-to-top.
    ========================================================================== */
 
-import { CONFIG, HERO, NAV, ARCHITECTURE } from "./data.js";
-import { copyText, esc } from "./utils.js";
-import {
-  renderNav, renderDrawer, buildMainHTML, renderFooter, archDetailHTML,
-} from "./components.js";
 
 const $  = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
@@ -29,20 +24,17 @@ if (CONFIG.repoUrl.includes("your-username")) {
   );
 }
 
-/* ---------- 2. Theme (dark default, persisted) ---------- */
+/* ---------- 2. Theme (toggle only, init moved to index.html) ---------- */
 const themeToggle = $("#themeToggle");
 const applyTheme = (t) => {
   document.documentElement.setAttribute("data-theme", t);
   try { localStorage.setItem("lionfs-theme", t); } catch { /* private mode */ }
 };
-applyTheme((() => {
-  try { return localStorage.getItem("lionfs-theme") || "dark"; }
-  catch { return "dark"; }
-})());
 themeToggle.addEventListener("click", () => {
   const cur = document.documentElement.getAttribute("data-theme");
   applyTheme(cur === "dark" ? "light" : "dark");
 });
+
 
 /* ---------- 3. Header state + scroll progress + back-to-top ---------- */
 const header = $("#siteHeader");
@@ -82,7 +74,7 @@ const setDrawer = (open) => {
 hamburger.addEventListener("click", () => setDrawer(!drawer.classList.contains("open")));
 $("#drawerClose").addEventListener("click", () => setDrawer(false));
 backdrop.addEventListener("click", () => setDrawer(false));
-$$(".nav-drawer nav a").forEach((a) => a.addEventListener("click", () => setDrawer(false)));
+$$(".nav-drawer a").forEach((a) => a.addEventListener("click", () => setDrawer(false)));
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") setDrawer(false);
 });

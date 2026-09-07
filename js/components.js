@@ -5,12 +5,6 @@
    interaction. No DOM reads here — keep it a deterministic template layer.
    ========================================================================== */
 
-import {
-  CONFIG, NAV, HERO, TICKER, HONESTY, PILLARS, CAPABILITIES, ARCHITECTURE,
-  WRITE_PATH, PERFORMANCE, COMPARISON, RELEASES, GUARDIAN, TOOLS, QUICKSTART,
-  DOCS, CTA, FOOTER, gh,
-} from "./data.js";
-import { esc, fmt, icon, highlightBash, LION_LOGO } from "./utils.js";
 
 /* ---------- helpers ---------- */
 
@@ -32,7 +26,7 @@ const reveal = (html, d = 0, kind = "") =>
 
 /* ---------- Navigation ---------- */
 
-export function renderNav() {
+function renderNav() {
   const links = NAV.map((n) => `<a href="#${n.id}" data-nav="${n.id}">${esc(n.label)}</a>`).join("");
   return `
   <a class="brand" href="#overview" aria-label="LionFS home">
@@ -56,7 +50,7 @@ export function renderNav() {
   </div>`;
 }
 
-export function renderDrawer() {
+function renderDrawer() {
   const links = NAV.map(
     (n) => `<a href="#${n.id}" data-nav="${n.id}">${esc(n.label)}<span class="k">0${NAV.indexOf(n) + 1}</span></a>`
   ).join("");
@@ -84,7 +78,7 @@ export function renderDrawer() {
 
 /* ---------- Hero ---------- */
 
-export function renderHero() {
+function renderHero() {
   const stats = HERO.stats
     .map(
       (s, i) => `
@@ -142,14 +136,14 @@ export function renderHero() {
   </section>`;
 }
 
-export function renderTicker() {
+function renderTicker() {
   const items = [...TICKER, ...TICKER]
     .map((k) => `<span class="ticker-item">${esc(k)}<i></i></span>`)
     .join("");
   return `<div class="ticker" aria-hidden="true"><div class="ticker-track">${items}</div></div>`;
 }
 
-export function renderHonesty() {
+function renderHonesty() {
   const chips = HONESTY.chips
     .map((c) => `<span class="chip ${c.cls}">${c.cls === "good" ? icon("checkCircle") : c.cls === "warn" ? icon("info") : icon("terminal")}${esc(c.label)}</span>`)
     .join("");
@@ -170,7 +164,7 @@ export function renderHonesty() {
 
 /* ---------- Pillars ---------- */
 
-export function renderPillars() {
+function renderPillars() {
   const cards = PILLARS.map((p, i) => {
     const points = p.points.map((pt) => `<li>${pt}</li>`).join("");
     return reveal(
@@ -204,7 +198,7 @@ export function renderPillars() {
 
 /* ---------- Capability bento ---------- */
 
-export function renderCapabilities() {
+function renderCapabilities() {
   const tiles = CAPABILITIES.map((c, i) => {
     return reveal(
       `
@@ -235,7 +229,7 @@ export function renderCapabilities() {
 
 /* ---------- Architecture explorer ---------- */
 
-export function renderArchitecture() {
+function renderArchitecture() {
   const oob = ARCHITECTURE.outOfBand
     .map((o) => `<div class="arch-oob">${icon(o.icon)}<span><b>${esc(o.label)}</b> — ${esc(o.desc)}</span></div>`)
     .join("");
@@ -270,7 +264,7 @@ export function renderArchitecture() {
   );
 }
 
-export function archDetailHTML(i) {
+function archDetailHTML(i) {
   const l = ARCHITECTURE.layers[i];
   const chips = l.chips.map((c) => `<span class="arch-chip">${esc(c)}</span>`).join("");
   return `
@@ -283,7 +277,7 @@ export function archDetailHTML(i) {
 
 /* ---------- Journey of a write ---------- */
 
-export function renderWritePath() {
+function renderWritePath() {
   const steps = WRITE_PATH.steps
     .map((s, i) => {
       const routes = s.routes
@@ -358,7 +352,7 @@ function benchRowHTML(row, mode) {
   </div>`;
 }
 
-export function renderPerformance() {
+function renderPerformance() {
   const kpis = PERFORMANCE.kpis
     .map(
       (k, i) => reveal(
@@ -459,7 +453,7 @@ function cmpCell(v, isLion) {
   return `<td${isLion ? ' class="lion"' : ""}><span class="v ${cls}">${mark}${text}</span></td>`;
 }
 
-export function renderComparison() {
+function renderComparison() {
   const head = `<tr>
     <th class="feat-h">Feature</th>
     ${COMPARISON.systems.map((s, i) => `<th class="${i === 0 ? "lion" : ""}">${esc(s)}</th>`).join("")}
@@ -508,7 +502,7 @@ export function renderComparison() {
 
 /* ---------- Releases timeline ---------- */
 
-export function renderReleases() {
+function renderReleases() {
   const maxTests = Math.max(...RELEASES.map((r) => r.tests), 1);
   const items = RELEASES.map((r, i) => {
     const cls = r.current ? "current" : r.major ? "major" : "minor";
@@ -548,7 +542,7 @@ export function renderReleases() {
 
 /* ---------- Guardian ---------- */
 
-export function renderGuardian() {
+function renderGuardian() {
   const blips = [
     { top: "18%", left: "63%", d: "0s" },
     { top: "38%", left: "76%", d: "1.1s", c: true },
@@ -603,7 +597,7 @@ export function renderGuardian() {
 
 /* ---------- Tools ---------- */
 
-export function renderTools() {
+function renderTools() {
   const cats = TOOLS.categories
     .map((c, i) => `<button class="fchip" data-toolcat="${c}" aria-selected="${i === 0}">${esc(c === "all" ? "All" : c)}</button>`)
     .join("");
@@ -662,7 +656,7 @@ function codeblock(lang, code) {
   </div>`;
 }
 
-export function renderQuickstart() {
+function renderQuickstart() {
   const steps = QUICKSTART.steps
     .map(
       (s, i) => reveal(
@@ -693,7 +687,7 @@ export function renderQuickstart() {
 
 /* ---------- Docs ---------- */
 
-export function renderDocs() {
+function renderDocs() {
   const cards = DOCS.map(
     (d, i) => reveal(
       `
@@ -721,7 +715,7 @@ export function renderDocs() {
 
 /* ---------- Final CTA ---------- */
 
-export function renderCTA() {
+function renderCTA() {
   const actions = CTA.actions
     .map((a) => {
       const href = a.external ? gh() : a.href;
@@ -747,7 +741,7 @@ export function renderCTA() {
 
 /* ---------- Footer ---------- */
 
-export function renderFooter() {
+function renderFooter() {
   const cols = FOOTER.columns
     .map(
       (c) => `
@@ -786,7 +780,7 @@ export function renderFooter() {
 
 /* ---------- Page assembly ---------- */
 
-export function buildMainHTML() {
+function buildMainHTML() {
   return [
     renderHero(),
     renderTicker(),

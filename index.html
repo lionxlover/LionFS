@@ -35,21 +35,37 @@
   <link rel="stylesheet" href="css/animations.css" />
   <link rel="stylesheet" href="css/responsive.css" />
 
+  <!-- Social Images -->
+  <meta property="og:image" content="https://lionxlover.github.io/LionFS/og-image.png" />
+  <meta name="twitter:image" content="https://lionxlover.github.io/LionFS/og-image.png" />
+
   <!-- Structured data -->
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     "name": "LionFS",
-    "applicationCategory": "SystemUtilities",
+    "applicationCategory": "DeveloperApplication",
     "operatingSystem": "Linux, macOS, Windows",
-    "softwareVersion": "3.8.0",
-    "programmingLanguage": "Rust",
-    "license": "MIT OR Apache-2.0",
-    "description": "A from-scratch, high-performance, self-healing universal file system written in Rust."
+    "description": "A from-scratch, high-performance, self-healing universal file system written in Rust.",
+    "softwareVersion": "3.8",
+    "license": "https://opensource.org/licenses/MIT",
+    "url": "https://lionxlover.github.io/LionFS/",
+    "codeRepository": "https://github.com/lionxlover/LionFS"
   }
   </script>
+
+  <!-- Prevent Theme FOUC (Flash of Unstyled Content) -->
+  <script>
+    (function() {
+      try {
+        var saved = localStorage.getItem("lionfs-theme");
+        if (saved) document.documentElement.setAttribute("data-theme", saved);
+      } catch (e) {}
+    })();
+  </script>
 </head>
+
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
   <div class="scroll-progress" aria-hidden="true"><span id="scrollProgressBar"></span></div>
@@ -58,7 +74,8 @@
     <div class="container nav-row" id="navRoot"><!-- nav injected by js/components.js --></div>
   </header>
 
-  <main id="main" class="app-root"><!-- all sections injected by js/components.js --></main>
+<main id="main" class="app-root" tabindex="-1"><!-- all sections injected by js/components.js --></main>
+
 
   <footer class="site-footer" id="siteFooter"><!-- footer injected by js/components.js --></footer>
 
@@ -69,12 +86,17 @@
   <noscript>
     <div style="font-family: system-ui, sans-serif; max-width: 640px; margin: 15vh auto; padding: 0 24px; color: #e6e8ee; text-align: center;">
       <h1 style="font-size: 1.6rem;">LionFS — JavaScript required</h1>
-      <p style="opacity: .7; line-height: 1.6;">This showcase site renders its content with JavaScript modules.
+      <p style="opacity: .7; line-height: 1.6;">This showcase site renders its content with JavaScript.
       Please enable JavaScript, or read the project directly in the repository's <code style="color:#f5a524;">README.md</code>.</p>
     </div>
   </noscript>
 
-  <!-- App bootstrap — content lives in js/, rendering in js/components.js, behaviour in js/app.js -->
-  <script type="module" src="js/app.js"></script>
+  <!-- App bootstrap — content lives in js/, rendering in js/components.js, behaviour in js/app.js.
+       Loaded as plain classic scripts (not type="module") so the site also works when opened
+       directly from disk / a file manager (content:// and file:// URIs block module fetches). -->
+  <script src="js/utils.js"></script>
+  <script src="js/data.js"></script>
+  <script src="js/components.js"></script>
+  <script src="js/app.js"></script>
 </body>
 </html>

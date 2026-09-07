@@ -1,15 +1,11 @@
 /* ==========================================================================
    LionFS — js/data.js
-   Single source of truth for ALL site content. Edit this file to update
-   the site — no HTML changes required.
+   Single source of truth for ALL site content.
    ========================================================================== */
 
-/* ---- Site configuration -------------------------------------------------
-   repoUrl: points every GitHub link (nav, docs, footer) at your repository.
-   Replace "your-username" after forking, and GitHub Pages links will work.
-   ------------------------------------------------------------------------ */
-export const CONFIG = {
-  repoUrl: "https://github.com/your-username/lionfs",
+/* ---- Site configuration ------------------------------------------------- */
+const CONFIG = {
+  repoUrl: "https://github.com/lionxlover/LionFS",
   version: "3.8.0",
   versionShort: "3.8",
   releaseName: "The Throughput Release",
@@ -21,10 +17,10 @@ export const CONFIG = {
   updated: "2026",
 };
 
-export const gh = (path = "") => `${CONFIG.repoUrl}/${path.replace(/^\/+/, "")}`;
+const gh = (path = "") => `${CONFIG.repoUrl}/${path.replace(/^\/+/, "")}`;
 
 /* ---- Navigation ---------------------------------------------------------- */
-export const NAV = [
+const NAV = [
   { id: "overview",    label: "Overview" },
   { id: "architecture", label: "Architecture" },
   { id: "performance",  label: "Performance" },
@@ -37,7 +33,7 @@ export const NAV = [
 ];
 
 /* ---- Hero ---------------------------------------------------------------- */
-export const HERO = {
+const HERO = {
   badge: `v${CONFIG.version} · ${CONFIG.releaseName}`,
   titleA: "The file system that",
   titleB: "heals itself.",
@@ -73,8 +69,8 @@ export const HERO = {
   },
 };
 
-/* ---- Ticker (keywords strip under hero) ---------------------------------- */
-export const TICKER = [
+/* ---- Ticker -------------------------------------------------------------- */
+const TICKER = [
   "io_uring", "WAL v2", "B-ε tree", "HAMT", "CoW", "birth generations",
   "ZNS", "SMR", "CXL-PMEM", "BLAKE3", "zstd", "FastCDC", "dedup",
   "O(1) snapshots", "RS(n,k)", "WFQ 8:4:1", "Guardian", "128-bit addressing",
@@ -82,7 +78,7 @@ export const TICKER = [
 ];
 
 /* ---- Honesty banner ------------------------------------------------------- */
-export const HONESTY = {
+const HONESTY = {
   title: "Honest by design",
   text:
     "LionFS is <strong>pre-alpha and unverified on real hardware</strong> — and every performance number on this site " +
@@ -95,8 +91,8 @@ export const HONESTY = {
   ],
 };
 
-/* ---- Five pillars (the 2.0 architecture, RFC-002) ------------------------- */
-export const PILLARS = [
+/* ---- Five pillars --------------------------------------------------------- */
+const PILLARS = [
   {
     numeral: "I",
     icon: "bolt",
@@ -164,8 +160,8 @@ export const PILLARS = [
   },
 ];
 
-/* ---- Capability bento (3.0 additions + 3.8 throughput wins) --------------- */
-export const CAPABILITIES = [
+/* ---- Capability bento ----------------------------------------------------- */
+const CAPABILITIES = [
   {
     span: 6, feature: true, icon: "journal", ver: "3.8",
     title: "Journal v2 — the WAL rewrite",
@@ -253,7 +249,7 @@ export const CAPABILITIES = [
 ];
 
 /* ---- Architecture explorer ------------------------------------------------ */
-export const ARCHITECTURE = {
+const ARCHITECTURE = {
   outOfBand: [
     { icon: "radar", label: "Guardian advisory bus", desc: "strictly out-of-band" },
     { icon: "zap",   label: "sim — deterministic crash simulator", desc: "power cuts at op indexes" },
@@ -327,7 +323,7 @@ export const ARCHITECTURE = {
 };
 
 /* ---- Journey of a write --------------------------------------------------- */
-export const WRITE_PATH = {
+const WRITE_PATH = {
   steps: [
     {
       icon: "inbox", tag: "VFS write",
@@ -354,7 +350,7 @@ export const WRITE_PATH = {
       desc: "Batches are picked by weighted fair queueing in virtual time (weights 8:4:1 → 61.5% / 30.8% / 7.7% service share). WAL v2 writes the ring as a few coalesced pwrites; the apply loop writes ascending contiguous runs.",
     },
     {
-      icon: "shield", tag: "PAL barrier",
+      icon: "shield", tag: "PAL durability barrier",
       title: "PAL durability barrier",
       desc: "fdatasync on Linux, F_FULLFSYNC on macOS, FlushFileBuffers on Windows — the PAL picks the strongest flavor each platform offers. Data AND metadata of the commit are atomic together.",
     },
@@ -377,7 +373,7 @@ export const WRITE_PATH = {
 };
 
 /* ---- Performance ----------------------------------------------------------- */
-export const PERFORMANCE = {
+const PERFORMANCE = {
   kpis: [
     { delta: "+59% vs 3.7", value: "568", unit: "MiB/s", label: "Seq write 4 KiB, buffered, fsync@end" },
     { delta: "21× vs ext4", value: "13", unit: "µs", label: "PUNCH_HOLE 4 KiB" },
@@ -430,7 +426,7 @@ export const PERFORMANCE = {
 };
 
 /* ---- Comparison matrix ------------------------------------------------------ */
-export const COMPARISON = {
+const COMPARISON = {
   systems: ["LionFS 3.8", "ext4", "XFS", "Btrfs", "ZFS", "NTFS", "ReFS", "APFS", "RedoxFS"],
   groups: [
     {
@@ -485,7 +481,7 @@ export const COMPARISON = {
 };
 
 /* ---- Releases timeline ------------------------------------------------------- */
-export const RELEASES = [
+const RELEASES = [
   { ver: "0.1.0", name: "Initial prototype", tests: 0, minor: true, desc: "The first extent-based layout, block allocator and FUSE mount.", hi: ["extents", "FUSE", "mkfs_lfs"] },
   { ver: "1.x", name: "Line folded into 2.0", tests: 245, minor: true, desc: "Core POSIX surface, journaling, checksums, RAID 0/1/5/6/10 — 245 tests at the fold.", hi: ["245 tests"] },
   { ver: "2.0", name: "Cross-platform architecture", tests: 462, major: true, desc: "The PAL, the io_uring engine, 128-bit addressing, B-ε + HAMT, media tiering, the data pipeline.", hi: ["PAL", "io_uring", "B-ε", "HAMT", "ZNS/SMR", "FastCDC"] },
@@ -501,7 +497,7 @@ export const RELEASES = [
 ];
 
 /* ---- Guardian ------------------------------------------------------------------ */
-export const GUARDIAN = {
+const GUARDIAN = {
   lead: "Guardian is the autonomous-operations layer — watching entropy curves, drive health and workload shape, and advising. It never touches the data path: the advisory bus is escalation-safe, rate-limited, and strictly out-of-band.",
   cards: [
     {
@@ -525,7 +521,7 @@ export const GUARDIAN = {
 };
 
 /* ---- Tools ---------------------------------------------------------------------- */
-export const TOOLS = {
+const TOOLS = {
   categories: ["all", "benchmark", "format", "mount", "snapshots", "replication", "ops", "media", "integrity", "debug"],
   featured: [
     { cmd: "lfs_versus", cat: "benchmark", desc: "The same-harness, same-host, head-to-head vs ext4 (medians of 3, CSV). The engine-level half of the full comparison run." },
@@ -564,7 +560,7 @@ export const TOOLS = {
 };
 
 /* ---- Quickstart ------------------------------------------------------------------- */
-export const QUICKSTART = {
+const QUICKSTART = {
   steps: [
     {
       title: "Get the toolchain",
@@ -622,7 +618,7 @@ cargo build --release --bin lfs_versus --bin mkfs_lfs
 };
 
 /* ---- Docs --------------------------------------------------------------------------- */
-export const DOCS = [
+const DOCS = [
   { icon: "book", title: "README.md", desc: "The honest overview — what the tree actually implements, deliberately not advertising what isn't there.", path: "README.md" },
   { icon: "layers", title: "docs/", desc: "Architecture deep-dives: platform support, io engine, addressing, media tiering, pipeline, reliability, RCU.", path: "docs/" },
   { icon: "scroll", title: "docs/rfc/", desc: "The normative RFCs: 002 architecture, 003 cross-platform, 004 unlimited, 005 format vault.", path: "docs/rfc/" },
@@ -634,7 +630,7 @@ export const DOCS = [
 ];
 
 /* ---- Final CTA & footer --------------------------------------------------------------- */
-export const CTA = {
+const CTA = {
   title: "Build it. Run the 840. Then decide.",
   text: "LionFS earns trust the slow way: reproducible numbers, money tests that found real bugs, and a crash simulator that wins every argument with the hardware.",
   cmd: "cargo test",
@@ -644,7 +640,7 @@ export const CTA = {
   ],
 };
 
-export const FOOTER = {
+const FOOTER = {
   tagline: "A from-scratch, self-healing universal file system in Rust. Pre-alpha, honest numbers only.",
   columns: [
     {
@@ -678,4 +674,3 @@ export const FOOTER = {
   status: `LionFS ${CONFIG.version} · ${CONFIG.license} · status: pre-alpha — unverified on real hardware.`,
   credit: `Static showcase · zero build step · ${CONFIG.updated}`,
 };
-

@@ -1595,4 +1595,4 @@ html[data-theme="light"] .cmp tbody tr:hover { background: rgba(20, 24, 36, 0.02
 }
 .back-to-top.show { opacity: 1; transform: none; pointer-events: auto; }
 .back-to-top:hover { color: var(--accent-bright); border-color: var(--accent-line); }
-.back-to-top svg { width: 18px; height: 18px; olo
+.back-to-top svg { width: 18px; height: 18px; }

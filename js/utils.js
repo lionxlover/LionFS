@@ -4,13 +4,13 @@
    ========================================================================== */
 
 /** Escape a string for safe innerHTML interpolation. */
-export const esc = (s) =>
+const esc = (s) =>
   String(s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   }[c]));
 
 /** Copy text to clipboard with a legacy fallback (file:// contexts). */
-export async function copyText(text) {
+async function copyText(text) {
   try {
     if (navigator.clipboard && window.isSecureContext) {
       await navigator.clipboard.writeText(text);
@@ -33,12 +33,12 @@ export async function copyText(text) {
 }
 
 /** Format a number with thousands separators. */
-export const fmt = (n) =>
+const fmt = (n) =>
   Number(n).toLocaleString("en-US", { maximumFractionDigits: 1 });
 
 /** Simple bash-syntax highlighter → HTML string (token spans).
     Understands: comments, $ prompts, flags, strings, numbers, paths, pipes. */
-export function highlightBash(code) {
+function highlightBash(code) {
   const lines = esc(code).split("\n");
   const KNOWN = new Set([
     "cargo", "sudo", "rustc", "target/release/mkfs_lfs", "target/release/mount_lfs",
@@ -129,11 +129,11 @@ const I = {
 };
 
 /** Render an icon by name: icon("bolt") → svg string. */
-export const icon = (name, cls = "") =>
+const icon = (name, cls = "") =>
   `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${I[name] || I.check}</svg>`;
 
 /** The LionFS mark — a geometric lion (12-spike mane star + face). */
-export const LION_LOGO = `
+const LION_LOGO = `
 <svg viewBox="0 0 64 64" fill="none" aria-hidden="true">
   <defs>
     <linearGradient id="lion-g" x1="0" y1="0" x2="1" y2="1">
@@ -147,4 +147,4 @@ export const LION_LOGO = `
   <rect x="34.2" y="29.2" width="6.4" height="2.7" rx="1.35" fill="url(#lion-g)" transform="rotate(12 37.4 30.55)"/>
   <path d="M29.2 36.6h5.6L32 39.9z" fill="url(#lion-g)"/>
   <path d="M32 39.9v2.4m0 0c-1.1 1.3-2.9 1.4-4 .5m4-.5c1.1 1.3 2.9 1.4 4 .5" stroke="url(#lion-g)" stroke-width="1.7" stroke-linecap="round"/>
-on by namte
+</svg>`;
