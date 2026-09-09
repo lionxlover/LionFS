@@ -55,7 +55,6 @@ fn simulate() {
     let mut file_zone: Vec<Option<u32>> = vec![None, None, None];
     let mut logical_bytes = 0u64;
     let mut physical_bytes = 0u64;
-    let mut zone_switches = 0usize;
     let mut placed_offsets: Vec<u64> = Vec::new();
 
     for i in 0..TOTAL {
@@ -81,7 +80,7 @@ fn simulate() {
     }
 
     let (appends, switches) = table.stats();
-    zone_switches = switches as usize;
+    let zone_switches = switches as usize;
 
     // Fill report.
     let fills = table.fill_report();

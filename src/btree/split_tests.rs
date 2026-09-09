@@ -31,8 +31,8 @@ pub struct TestKey(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TestValue(pub u64);
 
-fn setup(_name: &str) -> (Disk, TransactionManager, Superblock, String) {
-    let path = format!("/tmp/lfs_btree_bug_{}.img", std::process::id());
+fn setup(name: &str) -> (Disk, TransactionManager, Superblock, String) {
+    let path = format!("/tmp/lfs_btree_bug_{}_{}.img", std::process::id(), name);
     let _ = std::fs::remove_file(&path);
     let disk = Disk::create(&path, 1024 * 1024 * 512).unwrap();
     let sb = Superblock {

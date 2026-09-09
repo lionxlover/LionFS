@@ -135,7 +135,7 @@ impl<'a> SendStream<'a> {
     /// blocks parsed as dir entries, checksums verified against the
     /// SNAPSHOT's frozen checksum view.
     fn snapshot_dir_entries(&mut self, dir: &Inode) -> Result<Vec<(u64, String, u8)>> {
-        let id = self.record.id;
+        let _id = self.record.id;
         let mut tx = TransactionManager::new(&self.sb).begin(0);
         let mut ctx = TxContext::new(self.disk, &mut tx);
         let mut dir_copy = *dir;
@@ -192,7 +192,7 @@ impl<'a> SendStream<'a> {
             let id = self.record.id;
             let mut tx = TransactionManager::new(&self.sb).begin(0);
             let mut ctx = TxContext::new(self.disk, &mut tx);
-            let mut inode_copy = *inode;
+            let inode_copy = *inode;
             // The frozen checksum tree needs a FROZEN handle --
             // `SnapshotManager::read_snapshot_csum` consults it per
             // block; the plain read path consults the LIVE tree, so we

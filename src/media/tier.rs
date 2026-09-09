@@ -186,12 +186,11 @@ fn has_clwb() -> bool {
         // SAFETY: __cpuid_count is safe to call on any x86_64 CPU (leaf
         // 7 gated by the max-leaf check first); it writes only its
         // return struct.
-        let max_leaf = unsafe { std::arch::x86_64::__cpuid(0).eax };
+        let max_leaf = std::arch::x86_64::__cpuid(0).eax;
         if max_leaf < 7 {
             return false;
         }
-        // SAFETY: as above, with the subleaf argument.
-        let info = unsafe { std::arch::x86_64::__cpuid_count(7, 0) };
+        let info = std::arch::x86_64::__cpuid_count(7, 0);
         (info.ebx >> 24) & 1 == 1
     })
 }

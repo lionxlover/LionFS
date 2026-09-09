@@ -14,6 +14,7 @@ pub fn build_mount_options(config: &MountConfig) -> Vec<MountOption> {
     let mut options = vec![
         MountOption::FSName("lionfs".to_string()),
         MountOption::DefaultPermissions,
+        MountOption::NoAtime,
     ];
     options.push(if config.read_only {
         MountOption::RO

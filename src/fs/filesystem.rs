@@ -151,10 +151,13 @@ pub struct SharedCore {
     /// of N -- the WAFL/PostgreSQL group-commit shape.
     pub commit_end: AtomicU64,
     pub inode_cache: InodeCache,
+    pub dentry_cache: RwLock<std::collections::HashMap<(u64, String), u64>>,
     pub key_manager: Mutex<KeyManager>,
     /// Phase 10 write-back intake cache: parallel `write()` calls,
     /// batched staging. See [`page_cache`] module docs.
     pub page_cache: PageCache,
+    pub flusher: Mutex<Option<std::thread::JoinHandle<()>>>,
+    pub flusher_shutdown: AtomicBool,
 }
 
 impl SharedCore {
@@ -720,8 +723,11 @@ unknown feature bits {unknown:#b} set",
             commit_seq: AtomicU64::new(0),
             commit_end: AtomicU64::new(0),
             inode_cache: InodeCache::new(10000),
+            dentry_cache: RwLock::new(std::collections::HashMap::new()),
             key_manager: Mutex::new(KeyManager::new()),
             page_cache: PageCache::new(),
+            flusher: Mutex::new(None),
+            flusher_shutdown: AtomicBool::new(false),
         });
 
         // Phase 11: the pipelined committer thread (disable with
@@ -729,6 +735,10 @@ unknown feature bits {unknown:#b} set",
         // behavior, for A/B measurement and debugging).
         if std::env::var("LFS_ASYNC_COMMIT").as_deref() != Ok("0") {
             SharedCore::start_committer(&core);
+        }
+
+        if core.page_cache.is_enabled() {
+            crate::fs::flusher::FlusherWorker::start(&core);
         }
 
         let scrubber = crate::worker::scrubber::ScrubberWorker::new();

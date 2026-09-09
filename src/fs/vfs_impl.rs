@@ -43,7 +43,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::filesystem::LionFS;
 use crate::ondisk::serialization::{Inode, BLOCK_SIZE};
 use crate::pal::posix;
-use crate::transaction::transaction::{Transaction, TxContext};
+use crate::transaction::transaction::TxContext;
 use crate::vfs::{
     VfsAttr, VfsCreate, VfsDirEntry, VfsError, VfsKind, VfsOps, VfsResult, VfsSetAttr, VfsStatFs,
 };
@@ -333,15 +333,21 @@ impl LionFS {
     /// active transaction OR in a group another thread already
     /// quiesced); empty when nothing is live at all (a clean fsync).
     pub(crate) fn flush_ino_marked(&self, ino: u64) -> std::io::Result<Vec<u64>> {
-        let gate = self.core.page_cache.gate(ino);
-        let _gate_guard = gate.lock().unwrap();
-        if !self.core.page_cache.has_pages(ino) {
-            return Ok(self.core.live_txids());
-        }
-        let (runs, drained_eof) = self.core.page_cache.drain_runs_and_eof(ino);
-        if runs.is_empty() {
-            return Ok(self.core.live_txids());
-        }
+        let flush_gate = self.core.page_cache.flush_gate(ino);
+        let _flush_guard = flush_gate.lock().unwrap();
+
+        let (runs, drained_eof) = {
+            let gate = self.core.page_cache.gate(ino);
+            let _gate_guard = gate.lock().unwrap();
+            if !self.core.page_cache.has_pages(ino) {
+                return Ok(self.core.live_txids());
+            }
+            let (runs, drained_eof) = self.core.page_cache.drain_runs_and_eof(ino);
+            if runs.is_empty() {
+                return Ok(self.core.live_txids());
+            }
+            (runs, drained_eof)
+        };
         let now = now_secs();
         let core = &self.core;
         let cached_size = core.inode_cache.get(ino).map(|i| i.size);
@@ -365,20 +371,17 @@ impl LionFS {
                 }
                 let cctx = core.resolve_block_cipher_ctx(ctx, &inode)?;
                 let pre_flush_size = inode.size;
-                for (start_block, bytes) in &runs {
-                    crate::file::writer::FileManager::write_file(
-                        ctx,
-                        &bg_desc,
-                        blocks_per_group,
-                        sb.checksum_tree_root,
-                        sb.refcount_tree_root,
-                        sb.dedupe_tree_root,
-                        &cctx,
-                        &mut inode,
-                        *start_block * BLOCK_SIZE as u64,
-                        bytes,
-                    )?;
-                }
+                crate::file::writer::FileManager::write_file_runs(
+                    ctx,
+                    &bg_desc,
+                    blocks_per_group,
+                    sb.checksum_tree_root,
+                    sb.refcount_tree_root,
+                    sb.dedupe_tree_root,
+                    &cctx,
+                    &mut inode,
+                    &runs,
+                )?;
                 // Phase 12 fix: block-granular storage, LOGICAL size.
                 // write_file saw whole pages; the file ends at
                 // max(pre-flush committed size, the shadow EOF) -- the
@@ -419,7 +422,7 @@ impl LionFS {
     /// (the intake path's threshold flush -- the dirty victim is
     /// usually the file being written, and re-taking its own gate
     /// would self-deadlock).
-    fn flush_ino_locked(&self, ino: u64) -> std::io::Result<()> {
+    pub(crate) fn flush_ino_locked(&self, ino: u64) -> std::io::Result<()> {
         if !self.core.page_cache.has_pages(ino) {
             return Ok(());
         }
@@ -432,24 +435,25 @@ impl LionFS {
         let (result, dirty) = self.with_stage_ctx(now, |ctx, sb| -> std::io::Result<()> {
             let bg_desc = core.get_bg_desc();
             let blocks_per_group = sb.blocks_per_group;
+            // Read the inode from the staging overlay (TxContext dirty_blocks map) first,
+            // falling back to the B-tree. The transaction's own dirty overlay already
+            // serves recently-written inode tree nodes from RAM, so this is typically
+            // O(tree_height) HashMap lookups, not disk reads.
             let mut inode =
                 crate::inode::manager::InodeManager::read_inode(ctx, sb.inode_tree_root, ino)?;
             let cctx = core.resolve_block_cipher_ctx(ctx, &inode)?;
             let pre_flush_size = inode.size;
-            for (start_block, bytes) in &runs {
-                crate::file::writer::FileManager::write_file(
-                    ctx,
-                    &bg_desc,
-                    blocks_per_group,
-                    sb.checksum_tree_root,
-                    sb.refcount_tree_root,
-                    sb.dedupe_tree_root,
-                    &cctx,
-                    &mut inode,
-                    *start_block * BLOCK_SIZE as u64,
-                    bytes,
-                )?;
-            }
+            crate::file::writer::FileManager::write_file_runs(
+                ctx,
+                &bg_desc,
+                blocks_per_group,
+                sb.checksum_tree_root,
+                sb.refcount_tree_root,
+                sb.dedupe_tree_root,
+                &cctx,
+                &mut inode,
+                &runs,
+            )?;
             // Phase 12 fix (same as flush_ino_marked): logical size is
             // max(pre-flush committed size, the shadow EOF).
             {
@@ -477,7 +481,14 @@ impl LionFS {
             Ok(())
         });
         result?;
-        if dirty > 1024 {
+        // Commit threshold (Btrfs / ZFS group-commit model): a commit is
+        // only triggered after enough blocks have accumulated in the active
+        // transaction. Committing too often forces a full journal write +
+        // fdatasync pair for each small batch of rand-writes; waiting
+        // longer amortizes that overhead across more blocks.
+        // 8192 blocks × 4 KiB = 32 MiB per group -- matches the new
+        // FLUSH_SOFT_LIMIT window and keeps journal pressure low.
+        if dirty >= 1024 {
             self.core.commit_one();
         }
         Ok(())
@@ -508,6 +519,7 @@ impl VfsOps for LionFS {
         // buffered page through staging, drive every remaining group
         // to retirement, then sync. Nothing dirty survives `destroy`
         // silently.
+        crate::fs::flusher::FlusherWorker::stop(&self.core);
         self.core.stop_committer();
         for ino in self.core.page_cache.dirty_inodes() {
             let _ = self.flush_ino(ino);
@@ -542,6 +554,13 @@ impl VfsOps for LionFS {
             }
         }
 
+        // Fast path: dentry cache hit (O(1) memory lookup)
+        if let Some(&cached_ino) = self.core.dentry_cache.read().unwrap().get(&(parent, name.to_string())) {
+            if let Ok(inode) = self.core.get_inode(cached_ino) {
+                return Ok(self.to_vfs_attr(&inode));
+            }
+        }
+
         let found: Option<Inode> = self.with_read_ctx(|ctx, sb| {
             if let Ok(mut parent_inode) = crate::inode::manager::InodeManager::read_inode(
                 ctx,
@@ -570,7 +589,10 @@ impl VfsOps for LionFS {
             None
         });
         match found {
-            Some(inode) => Ok(self.to_vfs_attr(&inode)),
+            Some(inode) => {
+                self.core.dentry_cache.write().unwrap().insert((parent, name.to_string()), inode.ino);
+                Ok(self.to_vfs_attr(&inode))
+            }
             None => Err(e(posix::ENOENT)),
         }
     }
@@ -813,10 +835,10 @@ impl VfsOps for LionFS {
         // Block range this read touches.
         let first_block = start / BLOCK_SIZE as u64;
         let last_block = (start + len as u64 - 1) / BLOCK_SIZE as u64;
-        let blocks: Vec<u64> = (first_block..=last_block).collect();
-        let cached = self.core.page_cache.get_pages(ino, &blocks);
+        let expected_blocks = (last_block - first_block + 1) as usize;
+        let cached = self.core.page_cache.get_pages_range(ino, first_block, last_block);
 
-        if cached.len() == blocks.len() {
+        if cached.len() == expected_blocks {
             // Fast path: entirely page-cache hits. No staging lock, no
             // disk -- this is the concurrent-read scale-out path.
             let mut out = vec![0u8; len];
@@ -854,7 +876,7 @@ impl VfsOps for LionFS {
             // page cache covers the whole range (buffered bytes are
             // strictly newer and were never on disk).
             Err(err) => {
-                if cached.len() < blocks.len() {
+                if cached.len() < expected_blocks {
                     return Err(VfsError::from_io(&err));
                 }
             }
@@ -891,65 +913,59 @@ impl VfsOps for LionFS {
         // with read-through fetch, shadow size/mtime, then return.
         // The caller's bytes are visible to reads immediately; they
         // become durable at the next flush/commit point.
+        
         let gate = self.core.page_cache.gate(ino);
         let _gate_guard = gate.lock().unwrap();
 
-        // Pre-fetch the committed content of every RMW-touched page
-        // that is not already cached (partial blocks within the
-        // committed size). Full fresh pages and pure appends fetch
-        // nothing -- this is why sequential writers never touch the
-        // staging lock on the intake path.
+        // Pre-fetch the committed content of at most two boundary blocks
+        // (head and tail) that are partial and within committed size.
+        // All interior blocks are full 4 KiB writes and require zero fetch.
+        // Eliminates heap allocation of HashMap on every write call.
         let committed_size = inode.size;
-        let mut fetch_cache: std::collections::HashMap<u64, [u8; BLOCK_SIZE]> =
-            std::collections::HashMap::new();
-        let mut pos = 0usize;
-        let mut cur = offset;
-        while pos < data.len() {
-            let within = (cur % BLOCK_SIZE as u64) as usize;
-            let chunk = (BLOCK_SIZE - within).min(data.len() - pos);
-            let full_fresh = within == 0 && chunk == BLOCK_SIZE;
-            let block = cur / BLOCK_SIZE as u64;
-            if !full_fresh
-                && (block * BLOCK_SIZE as u64) < committed_size
-                && !self.core.page_cache.has_page(ino, block)
-                && !fetch_cache.contains_key(&block)
+        let mut head_fetch: Option<(u64, [u8; BLOCK_SIZE])> = None;
+        let mut tail_fetch: Option<(u64, [u8; BLOCK_SIZE])> = None;
+
+        if !data.is_empty() {
+            let head_block = offset / BLOCK_SIZE as u64;
+            let head_within = (offset % BLOCK_SIZE as u64) as usize;
+            if head_within != 0
+                && (head_block * BLOCK_SIZE as u64) < committed_size
+                && !self.core.page_cache.has_page(ino, head_block)
             {
-                fetch_cache.insert(block, self.fetch_block(&inode, block));
+                head_fetch = Some((head_block, self.fetch_block(&inode, head_block)));
             }
-            pos += chunk;
-            cur += chunk as u64;
+
+            let end = offset + data.len() as u64;
+            let tail_within = (end % BLOCK_SIZE as u64) as usize;
+            let tail_block = (end - 1) / BLOCK_SIZE as u64;
+            if tail_within != 0
+                && tail_block != head_block
+                && (tail_block * BLOCK_SIZE as u64) < committed_size
+                && !self.core.page_cache.has_page(ino, tail_block)
+            {
+                tail_fetch = Some((tail_block, self.fetch_block(&inode, tail_block)));
+            }
         }
 
         self.core.page_cache.store(ino, offset, data, now, |block| {
-            fetch_cache
-                .get(&block)
-                .copied()
-                .unwrap_or([0u8; BLOCK_SIZE])
+            if let Some((b, page)) = head_fetch {
+                if b == block {
+                    return page;
+                }
+            }
+            if let Some((b, page)) = tail_fetch {
+                if b == block {
+                    return page;
+                }
+            }
+            [0u8; BLOCK_SIZE]
         });
 
-        // Bounded memory: past the dirty threshold, flush the largest
-        // writer. This is the lazy group-commit trigger -- no
-        // background thread, so every path stays deterministic. We
-        // still hold THIS inode's gate: if the victim is this inode,
-        // flush through the locked variant (re-taking our own gate
-        // would deadlock); otherwise take the victim's gate normally.
-        if self.core.page_cache.total_dirty() > crate::fs::page_cache::FLUSH_THRESHOLD_BYTES {
-            if let Some(victim) = self.core.page_cache.largest_dirty() {
-                // Try-lock only: the victim's own writer may hold its
-                // gate and be waiting on THIS inode's gate for its own
-                // threshold flush (a blocking take could cross-deadlock
-                // the two). The threshold is advisory -- if we lose the
-                // race, the victim flushes on its own trigger, fsync,
-                // or destroy.
-                let _res = if victim == ino {
-                    self.flush_ino_locked(victim)
-                } else {
-                    match self.core.page_cache.gate(victim).try_lock() {
-                        Ok(_held) => self.flush_ino_locked(victim),
-                        Err(_) => Ok(()),
-                    }
-                };
-            }
+        // Bounded memory / ZFS-style ARC dirty coalescing:
+        // Background flusher drains dirty inodes asynchronously.
+        // If hard limit is breached, the writer directly flushes its held inode.
+        if self.core.page_cache.total_dirty() > crate::fs::page_cache::FLUSH_HARD_LIMIT_BYTES {
+            let _ = self.flush_ino_locked(ino);
         }
         Ok(data.len() as u32)
     }
@@ -1089,7 +1105,9 @@ impl VfsOps for LionFS {
 
         match final_inode {
             Some(inode) => {
-                self.core.commit_one();
+                self.core.dentry_cache.write().unwrap().insert((parent, name.to_string()), inode.ino);
+                self.core.inode_cache.insert(inode.ino, inode, false);
+                self.core.commit_wake.notify_one();
                 Ok(self.to_vfs_attr(&inode))
             }
             None => Err(e(posix::EIO)),
@@ -1278,7 +1296,9 @@ impl VfsOps for LionFS {
 
         match final_inode {
             Some(inode) => {
-                self.core.commit_one();
+                self.core.dentry_cache.write().unwrap().insert((parent, name.to_string()), inode.ino);
+                self.core.inode_cache.insert(inode.ino, inode, false);
+                self.core.commit_wake.notify_one();
                 Ok(self.to_vfs_attr(&inode))
             }
             None => Err(e(posix::EIO)),
@@ -1360,7 +1380,8 @@ impl VfsOps for LionFS {
 
         match target_ino_out {
             Some(target_ino) => {
-                self.core.commit_one();
+                self.core.dentry_cache.write().unwrap().remove(&(parent, name.to_string()));
+                self.core.commit_wake.notify_one();
                 // Phase 10: an unlinked file's unsynced buffered pages
                 // were never promised durability (the standard
                 // write-back contract) -- drop them with the link.
@@ -1544,7 +1565,12 @@ impl VfsOps for LionFS {
         }
 
         if success {
-            self.core.commit_one();
+            {
+                let mut dcache = self.core.dentry_cache.write().unwrap();
+                dcache.remove(&(parent, name.to_string()));
+                dcache.remove(&(newparent, newname.to_string()));
+            }
+            self.core.commit_wake.notify_one();
             Ok(())
         } else {
             Err(e(posix::ENOENT))
@@ -2044,7 +2070,7 @@ impl LionFS {
     /// 3.3's synchronous write path, byte for byte, for compressed
     /// inodes and `LFS_WRITEBACK=0` (write-through mode). Stages the
     /// write into the shared transaction under the staging lock and
-    /// commits when the transaction crosses 1024 dirty blocks.
+    /// commits when the transaction crosses 8192 dirty blocks (~32 MiB).
     fn write_through(&self, ino: u64, offset: u64, data: &[u8], now: u64) -> VfsResult<u32> {
         let mut success = false;
         let mut dirty_after = 0usize;
@@ -2124,7 +2150,7 @@ impl LionFS {
         }
 
         if success {
-            if dirty_after > 1024 {
+            if dirty_after > 8192 {
                 self.core.commit_one();
             }
             Ok(data.len() as u32)

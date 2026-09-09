@@ -33,16 +33,20 @@ use std::os::windows::fs::FileExt as WinFileExt;
 /// at or past end-of-device) is `UnexpectedEof`, never success with stale
 /// buffer contents.
 #[inline]
-pub fn pread_full(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
-    let n = pread_at(file, buf, offset)?;
-    if n != buf.len() {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            format!(
-                "short read: got {n} of {} bytes at offset {offset}",
-                buf.len()
-            ),
-        ));
+pub fn pread_full(file: &File, mut buf: &mut [u8], mut offset: u64) -> Result<()> {
+    while !buf.is_empty() {
+        let n = pread_at(file, buf, offset)?;
+        if n == 0 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                format!(
+                    "short read: unexpected EOF at offset {offset}",
+                ),
+            ));
+        }
+        let rest = std::mem::take(&mut buf);
+        buf = &mut rest[n..];
+        offset += n as u64;
     }
     Ok(())
 }
@@ -50,18 +54,22 @@ pub fn pread_full(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
 /// Writes exactly `buf.len()` bytes at `offset`; partial writes are an
 /// error. Returns the number of bytes written on success (== `buf.len()`).
 #[inline]
-pub fn pwrite_full(file: &File, buf: &[u8], offset: u64) -> Result<usize> {
-    let n = pwrite_at(file, buf, offset)?;
-    if n != buf.len() {
-        return Err(Error::new(
-            ErrorKind::WriteZero,
-            format!(
-                "short write: got {n} of {} bytes at offset {offset}",
-                buf.len()
-            ),
-        ));
+pub fn pwrite_full(file: &File, mut buf: &[u8], mut offset: u64) -> Result<usize> {
+    let total = buf.len();
+    while !buf.is_empty() {
+        let n = pwrite_at(file, buf, offset)?;
+        if n == 0 {
+            return Err(Error::new(
+                ErrorKind::WriteZero,
+                format!(
+                    "short write: 0 bytes written at offset {offset}",
+                ),
+            ));
+        }
+        buf = &buf[n..];
+        offset += n as u64;
     }
-    Ok(n)
+    Ok(total)
 }
 
 /// Platform positioned read; returns bytes read.

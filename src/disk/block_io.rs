@@ -165,15 +165,29 @@ impl Disk {
         })
     }
 
-    pub fn create<P: AsRef<Path>>(path: P, size_bytes: u64) -> Result<Self> {
-        let path_label = path.as_ref().to_string_lossy().to_string();
+    pub(crate) fn open_or_create_device<P: AsRef<Path>>(path: P, size_bytes: u64) -> Result<File> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            if let Ok(meta) = std::fs::metadata(path.as_ref()) {
+                if meta.file_type().is_block_device() {
+                    return OpenOptions::new().read(true).write(true).open(path);
+                }
+            }
+        }
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(path)?;
-        file.set_len(size_bytes)?;
+        let _ = file.set_len(size_bytes);
+        Ok(file)
+    }
+
+    pub fn create<P: AsRef<Path>>(path: P, size_bytes: u64) -> Result<Self> {
+        let path_label = path.as_ref().to_string_lossy().to_string();
+        let file = Self::open_or_create_device(path, size_bytes)?;
         let geo = probe_and_validate(&file, 0, &path_label)?;
         Ok(Self {
             files: vec![Arc::new(file)],
@@ -206,13 +220,7 @@ impl Disk {
         let mut files = Vec::with_capacity(paths.len());
         let mut geometries = Vec::with_capacity(paths.len());
         for (i, p) in paths.iter().enumerate() {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(p)?;
-            file.set_len(size_per_device_bytes)?;
+            let file = Self::open_or_create_device(p, size_per_device_bytes)?;
             let geo = probe_and_validate(&file, i, &p.as_ref().to_string_lossy())?;
             files.push(Arc::new(file));
             geometries.push(geo);
@@ -585,6 +593,44 @@ impl Disk {
 
         if let Some(err) = errors.into_iter().next() {
             return Err(err);
+        }
+        Ok(())
+    }
+
+    pub fn write_contiguous_run(&self, start_block: u64, buf: &[u8]) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if start_block == 0 {
+            let first_len = buf.len().min(BLOCK_SIZE);
+            for f in &self.files {
+                pwrite_full(f, &buf[..first_len], 0)?;
+            }
+            if buf.len() <= BLOCK_SIZE {
+                return Ok(());
+            }
+            return self.write_contiguous_run(1, &buf[BLOCK_SIZE..]);
+        }
+        if self.files.len() == 1 && self.raid_engine.profile == RaidProfile::Single {
+            pwrite_full(&self.files[0], buf, start_block * BLOCK_SIZE as u64)?;
+            return Ok(());
+        }
+        for (i, chunk) in buf.chunks(BLOCK_SIZE).enumerate() {
+            self.write_block(start_block + i as u64, chunk)?;
+        }
+        Ok(())
+    }
+
+    pub fn read_contiguous_run(&self, start_block: u64, buf: &mut [u8]) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if self.files.len() == 1 && self.raid_engine.profile == RaidProfile::Single {
+            pread_full(&self.files[0], buf, start_block * BLOCK_SIZE as u64)?;
+            return Ok(());
+        }
+        for (i, chunk) in buf.chunks_mut(BLOCK_SIZE).enumerate() {
+            self.read_block(start_block + i as u64, chunk)?;
         }
         Ok(())
     }

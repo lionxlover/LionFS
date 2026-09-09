@@ -165,7 +165,9 @@ pub struct ThreadedEngine {
     workers: Vec<std::thread::JoinHandle<()>>,
     /// Devices/arena are cloned into the workers; kept here for teardown
     /// diagnostics and future topology introspection.
+    #[allow(dead_code)]
     devices: Arc<[Arc<File>]>,
+    #[allow(dead_code)]
     arena: Arc<RegisteredBufArena>,
     stats: Arc<EngineStats>,
     in_flight: Arc<AtomicU64>,
@@ -425,9 +427,12 @@ mod tests {
     use super::*;
 
     fn temp_device(tag: &str, size: u64) -> Arc<File> {
-        let dir = std::env::temp_dir().join(format!("lionfs_engine_{}", std::process::id()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("lionfs_engine_{}_{}", std::process::id(), c));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{tag}.img"));
+        let path = dir.join(format!("{tag}_{c}.img"));
         Arc::new(pal::file::create_image(&path, size).unwrap())
     }
 
@@ -494,7 +499,7 @@ mod tests {
 
     #[test]
     fn flush_data_completes() {
-        let (engine, arena) = test_engine();
+        let (engine, _arena) = test_engine();
         let ops = [IoOp::flush_data(0, 1)];
         assert_eq!(engine.submit(&ops), 1);
         let mut out = Vec::new();

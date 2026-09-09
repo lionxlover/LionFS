@@ -29,7 +29,7 @@ use crate::integrity::refcount::RefCountManager;
 use crate::ondisk::serialization::{BlockGroupDescriptor, Inode, Superblock, BLOCK_SIZE};
 use crate::security::block_cipher::BlockCipherContext;
 use crate::transaction::manager::TransactionManager;
-use crate::transaction::transaction::{Transaction, TxContext};
+use crate::transaction::transaction::TxContext;
 use crate::vfs::VfsOps;
 
 // -------------------------------------------------------------------
@@ -84,7 +84,7 @@ struct Phase11Env {
 fn setup(tag: &str, csum_on: bool) -> Phase11Env {
     let path = std::env::temp_dir().join(format!("test_p11_{tag}.img"));
     let _ = std::fs::remove_file(&path);
-    let mut disk = Disk::create(&path, 1024 * 1024 * 16).unwrap();
+    let disk = Disk::create(&path, 1024 * 1024 * 16).unwrap();
     let mut sb = zero_sb();
     sb.inode_tree_root = 20;
     sb.checksum_tree_root = if csum_on { 22 } else { 0 };
@@ -381,7 +381,7 @@ fn pin_mode_fallback_when_csums_off() {
     write_inode_fixture(ctx, &inode);
     let pinned_phys = inode.extents[0].physical_start;
 
-    let (burned, mut sb2) = snapshot_fixture(ctx, 0, 1);
+    let (_burned, mut sb2) = snapshot_fixture(ctx, 0, 1);
     // Pin mode: the walk ran -- proven by the PIN below (the coverage
     // entry exists), which birth mode never creates. Allocation count
     // is not the evidence (tree inserts may not split at this size).
@@ -566,11 +566,10 @@ fn pipelined_durable_two_writers_survive_remount() {
     // Remount: everything must be there, exactly.
     let fs = remount(tag);
     {
-        use crate::disk::block_io::Disk as _DiskTrait;
         let mut dbuf = [0u8; BLOCK_SIZE];
         let mut report = Vec::new();
         for loc in [0u64, 8192, 16384] {
-            let mut d = crate::disk::block_io::Disk::open(
+            let d = crate::disk::block_io::Disk::open(
                 &std::env::temp_dir().join(format!("test_par10_{tag}.img")),
             )
             .unwrap();

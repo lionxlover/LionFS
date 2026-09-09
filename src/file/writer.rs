@@ -210,6 +210,11 @@ impl FileManager {
         let read_size = min(size, inode.size - offset);
         let mut data = vec![0u8; read_size as usize];
         let mut data_pos = 0;
+        let csum_tree = if checksum_tree_root != 0 {
+            Some(ChecksumTree::new(checksum_tree_root))
+        } else {
+            None
+        };
         let mut current_offset = offset;
 
         while data_pos < read_size {
@@ -232,13 +237,12 @@ impl FileManager {
                 // Verify checksum -- always against the on-disk bytes
                 // (post-compression/encryption if active), since that's
                 // what could actually get corrupted on the physical medium.
-                if checksum_tree_root != 0 {
-                    let csum_tree = ChecksumTree::new(checksum_tree_root);
+                if let Some(ref tree) = csum_tree {
                     let key = ChecksumTreeKey {
                         object_id: inode.ino,
                         logical_block,
                     };
-                    if let Ok(Some(val)) = csum_tree.lookup_checksum(ctx, &key) {
+                    if let Ok(Some(val)) = tree.lookup_checksum(ctx, &key) {
                         let algo = ChecksumAlgorithm::from_u8(val.algorithm_id);
                         if !verify_checksum(algo, &buf, &val.checksum_bytes) {
                             // Corruption detected!
@@ -711,6 +715,312 @@ impl FileManager {
 
         if offset + data.len() as u64 > inode.size {
             inode.size = offset + data.len() as u64;
+        }
+
+        Ok(())
+    }
+
+    /// Btrfs-inspired batched multi-run writer:
+    /// Processes all drained dirty runs in ONE unified pass, sharing the
+    /// `ChecksumTree` handle and `locality_hint` across all runs to amortize
+    /// tree descents and preserve spatial disk locality during random 4K writes.
+    pub fn write_file_runs(
+        ctx: &mut TxContext,
+        bg_desc: &BlockGroupDescriptor,
+        blocks_per_group: u32,
+        checksum_tree_root: u64,
+        refcount_tree_root: u64,
+        dedupe_tree_root: u64,
+        cctx: &BlockCipherContext,
+        inode: &mut Inode,
+        runs: &[(u64, Vec<u8>)],
+    ) -> Result<()> {
+        if runs.is_empty() {
+            return Ok(());
+        }
+        if inode.compression_algo != 0 {
+            for (start_block, bytes) in runs {
+                Self::write_file(
+                    ctx,
+                    bg_desc,
+                    blocks_per_group,
+                    checksum_tree_root,
+                    refcount_tree_root,
+                    dedupe_tree_root,
+                    cctx,
+                    inode,
+                    *start_block * BLOCK_SIZE as u64,
+                    bytes,
+                )?;
+            }
+            return Ok(());
+        }
+
+        let mut csum_tree = if checksum_tree_root != 0 {
+            Some(ChecksumTree::new(checksum_tree_root))
+        } else {
+            None
+        };
+        let mut locality_hint: Option<u64> = Self::last_physical_end(ctx, inode).unwrap_or(None);
+        let dedup_on = dedupe_tree_root != 0 && !cctx.is_active() && dedup_enabled();
+        // Deferred checksum insert map: collect (logical_block → (physical_block, content))
+        // during the write loop and flush them to the checksum B-tree in ascending key order
+        // afterwards.  Ascending order maximises FastLeaf/RangeLeaf hits; deduplication
+        // collapses repeated writes to the same logical block into one insert.
+        // Only allocated when the checksum tree is active (avoids the Box cost otherwise).
+        let mut deferred_csums: std::collections::BTreeMap<u64, (u64, Box<[u8; BLOCK_SIZE]>)> =
+            if checksum_tree_root != 0 {
+                std::collections::BTreeMap::new()
+            } else {
+                std::collections::BTreeMap::new() // empty, will never be inserted into
+            };
+
+        for (start_block, data) in runs {
+            let offset = *start_block * BLOCK_SIZE as u64;
+            let mut data_pos = 0;
+            let mut current_offset = offset;
+            let append_write = !data.is_empty() && crate::allocator::extents::is_sequential_write(offset, inode.size);
+
+            while data_pos < data.len() {
+                let logical_block = current_offset / BLOCK_SIZE as u64;
+                let block_offset = (current_offset % BLOCK_SIZE as u64) as usize;
+
+                let mut physical_block =
+                    Self::get_physical_block(ctx, inode, logical_block).unwrap_or(0);
+
+                let barrier = ctx.effective_cow_barrier();
+                if physical_block != 0 && (refcount_tree_root != 0 || barrier > 0) {
+                    let pinned = if refcount_tree_root != 0 {
+                        let rc = crate::integrity::refcount::RefCountManager::new(refcount_tree_root);
+                        rc.is_pinned(ctx, physical_block)?
+                    } else {
+                        false
+                    };
+                    let birth_protected = !pinned
+                        && barrier > 0
+                        && csum_tree.as_ref().is_some_and(|tree| {
+                            let key = ChecksumTreeKey {
+                                object_id: inode.ino,
+                                logical_block,
+                            };
+                            tree.lookup_checksum(ctx, &key)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|v| {
+                                    v.physical_block == physical_block && v.generation <= barrier
+                                })
+                        });
+                    if pinned || birth_protected {
+                        let new_block = Allocator::allocate_extents(ctx, bg_desc, blocks_per_group, 1)?;
+                        let mut old = [0u8; BLOCK_SIZE];
+                        ctx.read_block(physical_block, &mut old)?;
+                        let old_plain = if cctx.is_active() {
+                            block_cipher::decode_block(ctx, cctx, physical_block, &old)?
+                        } else {
+                            old.to_vec()
+                        };
+                        if cctx.is_active() {
+                            let disk_bytes = block_cipher::encode_block(ctx, cctx, new_block, &old_plain, |c| {
+                                Allocator::allocate_extents(c, bg_desc, blocks_per_group, 1)
+                            })?;
+                            ctx.write_block_owned(new_block, disk_bytes)?;
+                        } else {
+                            ctx.write_block(new_block, &old_plain)?;
+                        }
+                        Self::remap_block(
+                            ctx,
+                            bg_desc,
+                            blocks_per_group,
+                            inode,
+                            logical_block,
+                            new_block,
+                        )?;
+                        readahead_invalidate(physical_block);
+                        physical_block = new_block;
+                    }
+                }
+
+                if physical_block == 0 {
+                    if dedup_on && block_offset == 0 && data.len() - data_pos >= BLOCK_SIZE {
+                        let hash = crate::fs::dedupe::DeduplicationManager::hash_block(
+                            &data[data_pos..data_pos + BLOCK_SIZE],
+                        );
+                        let dtree = crate::fs::dedupe::DedupeTree::new(dedupe_tree_root);
+                        if let Some(rec) = dtree.find(ctx, hash)? {
+                            let mut probe = [0u8; BLOCK_SIZE];
+                            let probe_ok = ctx.read_block(rec.physical_block, &mut probe).is_ok();
+                            if probe_ok && crate::fs::dedupe::DeduplicationManager::hash_block(&probe) == hash {
+                                Self::add_extent(
+                                    ctx,
+                                    bg_desc,
+                                    blocks_per_group,
+                                    inode,
+                                    logical_block,
+                                    rec.physical_block,
+                                    1,
+                                )?;
+                                let mut alloc_meta = |c: &mut TxContext| {
+                                    Allocator::allocate_extents_meta(c, bg_desc, blocks_per_group, 1)
+                                };
+                                let mut dtree_mut = crate::fs::dedupe::DedupeTree::new(dedupe_tree_root);
+                                dtree_mut.increment_ref(ctx, hash, &mut alloc_meta)?;
+                                if refcount_tree_root != 0 {
+                                    let mut rc = crate::integrity::refcount::RefCountManager::new(refcount_tree_root);
+                                    if rc.coverage_at(ctx, rec.physical_block)? == 0 {
+                                        rc.pin_range(ctx, rec.physical_block, 1, &mut alloc_meta)?;
+                                    }
+                                }
+                                if csum_tree.is_some() {
+                                    let mut checksum_buf = [0u8; BLOCK_SIZE];
+                                    checksum_buf.copy_from_slice(&probe);
+                                    deferred_csums.insert(logical_block, (rec.physical_block, Box::new(checksum_buf)));
+                                }
+                                data_pos += BLOCK_SIZE;
+                                current_offset += BLOCK_SIZE as u64;
+                                continue;
+                            }
+                        }
+                    }
+                    if append_write {
+                        let last_block = (offset + data.len() as u64 - 1) / BLOCK_SIZE as u64;
+                        let mark = last_block - logical_block + 1;
+                        let want = crate::allocator::extents::size_for_request(
+                            mark * BLOCK_SIZE as u64,
+                            BLOCK_SIZE as u64,
+                            true,
+                        ).max(mark);
+                        physical_block = Allocator::allocate_extents_reserved(
+                            ctx,
+                            bg_desc,
+                            blocks_per_group,
+                            want,
+                            mark,
+                            locality_hint,
+                        )?;
+                        locality_hint = Some(physical_block + mark);
+                        Self::add_extent(
+                            ctx,
+                            bg_desc,
+                            blocks_per_group,
+                            inode,
+                            logical_block,
+                            physical_block,
+                            mark,
+                        )?;
+                    } else {
+                        physical_block = match locality_hint {
+                            Some(h) => Allocator::allocate_extents_hinted(
+                                ctx,
+                                bg_desc,
+                                blocks_per_group,
+                                1,
+                                h,
+                            )?,
+                            None => Allocator::allocate_extents(ctx, bg_desc, blocks_per_group, 1)?,
+                        };
+                        locality_hint = Some(physical_block + 1);
+                        Self::add_extent(
+                            ctx,
+                            bg_desc,
+                            blocks_per_group,
+                            inode,
+                            logical_block,
+                            physical_block,
+                            1,
+                        )?;
+                    }
+                }
+
+                let mut buf = [0u8; BLOCK_SIZE];
+                let chunk_size = min(BLOCK_SIZE - block_offset, data.len() - data_pos);
+
+                if chunk_size < BLOCK_SIZE && physical_block != 0 {
+                    let mut disk_buf = [0u8; BLOCK_SIZE];
+                    ctx.read_block(physical_block, &mut disk_buf)?;
+                    if cctx.is_active() {
+                        let plain = block_cipher::decode_block(ctx, cctx, physical_block, &disk_buf)?;
+                        buf.copy_from_slice(&plain);
+                    } else {
+                        buf = disk_buf;
+                    }
+                }
+
+                buf[block_offset..block_offset + chunk_size].copy_from_slice(&data[data_pos..data_pos + chunk_size]);
+
+                if cctx.is_active() {
+                    let disk_bytes: Vec<u8> = block_cipher::encode_block(ctx, cctx, physical_block, &buf, |c| {
+                        Allocator::allocate_extents(c, bg_desc, blocks_per_group, 1)
+                    })?;
+                    readahead_invalidate(physical_block);
+                    ctx.write_block_owned(physical_block, disk_bytes.clone())?;
+                    // Defer checksum: store encrypted bytes for post-loop batch insert
+                    // (same ascending-order / dedup benefit as the plaintext path).
+                    if csum_tree.is_some() {
+                        let mut checksum_buf = [0u8; BLOCK_SIZE];
+                        let copy_len = disk_bytes.len().min(BLOCK_SIZE);
+                        checksum_buf[..copy_len].copy_from_slice(&disk_bytes[..copy_len]);
+                        deferred_csums.insert(logical_block, (physical_block, Box::new(checksum_buf)));
+                    }
+                } else {
+                    readahead_invalidate(physical_block);
+                    ctx.write_block(physical_block, &buf)?;
+                    if dedup_on && chunk_size == BLOCK_SIZE && block_offset == 0 {
+                        let hash = crate::fs::dedupe::DeduplicationManager::hash_block(&buf);
+                        let mut dtree = crate::fs::dedupe::DedupeTree::new(dedupe_tree_root);
+                        let mut alloc_meta = |c: &mut TxContext| {
+                            Allocator::allocate_extents_meta(c, bg_desc, blocks_per_group, 1)
+                        };
+                        if dtree.find(ctx, hash)?.is_none() {
+                            dtree.insert_new(ctx, hash, physical_block, &mut alloc_meta)?;
+                        }
+                    }
+                    // Deferred checksum: record (logical_block -> (physical, buf)) for
+                    // post-loop batch insert in ascending key order.  Overwrites of the
+                    // same logical block within this flush are automatically deduplicated;
+                    // the last write wins (correct -- it is the final committed content).
+                    if csum_tree.is_some() {
+                        let mut checksum_buf = [0u8; BLOCK_SIZE];
+                        checksum_buf.copy_from_slice(&buf);
+                        deferred_csums.insert(logical_block, (physical_block, Box::new(checksum_buf)));
+                    }
+                }
+
+                data_pos += chunk_size;
+                current_offset += chunk_size as u64;
+            }
+
+            if offset + data.len() as u64 > inode.size {
+                inode.size = offset + data.len() as u64;
+            }
+        }
+
+        // Flush deferred checksums in ascending logical-block order.
+        // Ascending order means every insert is strictly greater than the
+        // previous, so the ChecksumTree's FastLeaf cache fires on EVERY
+        // insert (no B-tree descent after the first).  This collapses
+        // O(N × tree_height) descents to O(1) descents + N leaf appends/
+        // overwrites -- the dominant rand-write cost at high IOPS.
+        if let Some(ref mut tree) = csum_tree {
+            let mut allocate_for_tree = |c: &mut TxContext| {
+                Allocator::allocate_extents_meta(c, bg_desc, blocks_per_group, 1)
+            };
+            for (logical_block, (physical_block, buf)) in &deferred_csums {
+                let algo = crate::integrity::algorithms::write_path_algorithm();
+                let csum_bytes = crate::integrity::algorithms::calculate_checksum(algo, buf.as_ref());
+                let key = ChecksumTreeKey {
+                    object_id: inode.ino,
+                    logical_block: *logical_block,
+                };
+                let val = ChecksumTreeValue {
+                    physical_block: *physical_block,
+                    checksum_bytes: csum_bytes,
+                    generation: crate::btree::tree::node_gen_stamp(),
+                    algorithm_id: algo as u8,
+                    verification_status: 1,
+                    padding: [0; 6],
+                };
+                tree.insert_checksum(ctx, key, val, &mut allocate_for_tree)?;
+            }
         }
 
         Ok(())

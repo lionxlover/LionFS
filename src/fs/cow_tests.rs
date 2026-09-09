@@ -76,7 +76,7 @@ struct CowEnv {
 
 fn setup(tag: &str, with_snapshot_tree: bool) -> CowEnv {
     let path = std::env::temp_dir().join(format!("test_cow_{tag}.img"));
-    let mut disk = Disk::create(&path, 1024 * 1024 * 16).unwrap();
+    let disk = Disk::create(&path, 1024 * 1024 * 16).unwrap();
     let mut sb = zero_sb();
     sb.inode_tree_root = 20;
     sb.checksum_tree_root = 22;

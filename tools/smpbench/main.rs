@@ -662,7 +662,6 @@ fn run_read_vfs_bench(args: &Args) {
     let img = format!("/tmp/vfsread_{}.img", std::process::id());
     let _ = std::fs::remove_file(&img);
     {
-        use lionfs_core::disk::block_io::Disk as _Disk;
         let mkfs = std::process::Command::new(std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("mkfs_lfs")))

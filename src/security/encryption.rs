@@ -17,7 +17,7 @@ use chacha20poly1305::{ChaCha20Poly1305 as RcChaCha20Poly1305, Nonce as ChaChaNo
 // constructing nonces, since that's the directly-exported, canonical path
 // for these crates.
 use aes_gcm::aead::{Aead, KeyInit};
-use std::io::{Error, ErrorKind, Read, Result};
+use std::io::{Error, ErrorKind, Result};
 
 pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;

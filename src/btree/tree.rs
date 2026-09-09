@@ -105,6 +105,15 @@ struct FastLeaf<K: BTreeKey> {
     epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RangeLeaf<K: BTreeKey> {
+    leaf_block: u64,
+    min_key: K,
+    max_key: K,
+    item_count: u16,
+    epoch: u64,
+}
+
 pub trait BTreeItem: Pod + Zeroable + Clone + Copy + std::fmt::Debug {}
 impl<T: Pod + Zeroable + Clone + Copy + std::fmt::Debug> BTreeItem for T {}
 
@@ -133,6 +142,7 @@ pub struct BTree<K: BTreeKey, V: BTreeItem> {
     pub root_block: u64,
     node_type: u32,
     fast_leaf: Option<FastLeaf<K>>,
+    range_leaf: Option<RangeLeaf<K>>,
     /// Phase 9: false (default) = LIVE-tree handle: reads honor the
     /// root cells/Disk mirror (a moved live root is always found).
     /// true = HISTORICAL view handle (snapshot reads, unpin walks):
@@ -149,6 +159,7 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
             root_block,
             node_type,
             fast_leaf: None,
+            range_leaf: None,
             frozen_view: false,
             _marker: PhantomData,
         }
@@ -162,6 +173,7 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
             root_block,
             node_type,
             fast_leaf: None,
+            range_leaf: None,
             frozen_view: true,
             _marker: PhantomData,
         }
@@ -187,68 +199,39 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
 
     /// Helper to read a node
     fn read_node(&self, ctx: &mut TxContext, block_num: u64) -> Result<BTreeNodeData> {
-        // Dirty in THIS transaction: the bytes came through `write_node`,
-        // which set the header checksum at write time, so re-verifying
-        // the CRC32C over the full 4 KiB node on every read is pure
-        // repeated work on the insert hot path. Serve straight from the
-        // dirty map. (Phase 3.2: this removes one full-node CRC per
-        // descent level per insert for every node written earlier in
-        // the same transaction -- on the checksum-tree path that is
-        // every level except the first descent's clean reads.)
-        if ctx.tx.dirty_blocks.contains_key(&block_num) {
+        let is_dirty = ctx.tx.dirty_blocks.contains_key(&block_num);
+        let node: BTreeNodeData = if is_dirty {
             let mut buf = [0u8; 4096];
             ctx.read_block(block_num, &mut buf)?;
-            return Ok(pod_read_unaligned(&buf));
-        }
-
-        if let Some(cache) = &ctx.node_cache {
-            if let Some(arc_node) = cache.get(block_num) {
-                // If it is dirty in TxContext, we still need the dirty version.
-                // Wait, if it is dirty in this transaction, we MUST read the dirty version.
-                // Check if dirty in TxContext:
-                // (Unreachable today: the dirty short-circuit above already
-                // returned. Kept for belt-and-suspenders if the guard order
-                // ever changes.)
-                if !ctx.tx.dirty_blocks.contains_key(&block_num) {
+            pod_read_unaligned(&buf)
+        } else {
+            if let Some(cache) = &ctx.node_cache {
+                if let Some(arc_node) = cache.get(block_num) {
                     let locked = arc_node.read().unwrap();
                     return Ok(*locked);
                 }
             }
-        }
 
-        let mut buf = [0u8; 4096];
-        ctx.read_block(block_num, &mut buf)?;
-        let node: BTreeNodeData = pod_read_unaligned(&buf);
+            let mut buf = [0u8; 4096];
+            ctx.read_block(block_num, &mut buf)?;
+            let node: BTreeNodeData = pod_read_unaligned(&buf);
 
-        if node.header.magic != BTREE_MAGIC || node.header.node_type != self.node_type {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "Invalid BTree node magic or type (block {block_num}: magic {:#x} type {} expected {}, item_count {})",
-                    node.header.magic, node.header.node_type, self.node_type, node.header.item_count
-                ),
-            ));
-        }
+            // Verify checksum
+            let expected_csum = node.header.checksum;
+            let mut node_copy = node;
+            node_copy.header.checksum = 0;
+            let csum_bytes = calculate_checksum(ChecksumAlgorithm::Crc32c, bytes_of(&node_copy));
+            let computed_csum = u32::from_le_bytes(csum_bytes[0..4].try_into().unwrap());
 
-        // Verify checksum
-        let expected_csum = node.header.checksum;
-        let mut node_copy = node;
-        node_copy.header.checksum = 0;
-        let csum_bytes = calculate_checksum(ChecksumAlgorithm::Crc32c, bytes_of(&node_copy));
-        let computed_csum = u32::from_le_bytes(csum_bytes[0..4].try_into().unwrap());
+            if expected_csum != computed_csum && expected_csum != 0 {
+                eprintln!("BTree Node Corruption detected at block {}", block_num);
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "BTree Node Checksum Mismatch",
+                ));
+            }
 
-        if expected_csum != computed_csum && expected_csum != 0 {
-            // Checksum mismatch
-            eprintln!("BTree Node Corruption detected at block {}", block_num);
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "BTree Node Checksum Mismatch",
-            ));
-        }
-
-        if let Some(cache) = &ctx.node_cache {
-            if !ctx.tx.dirty_blocks.contains_key(&block_num) {
-                // Ensure we insert a cache-line aligned copy
+            if let Some(cache) = &ctx.node_cache {
                 let mut aligned_node = BTreeNodeData::new(node.header.level, node.header.node_type);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -259,6 +242,40 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
                 }
                 cache.insert(block_num, aligned_node);
             }
+            node
+        };
+
+        if node.header.magic != BTREE_MAGIC || node.header.node_type != self.node_type {
+            eprintln!(
+                "Invalid BTree node magic or type (block {block_num}: magic {:#x} expected {:#x}, type {} expected {}, item_count {}, dirty {})",
+                node.header.magic, BTREE_MAGIC, node.header.node_type, self.node_type, node.header.item_count, is_dirty
+            );
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "Invalid BTree node magic or type (block {block_num}: magic {:#x} type {} expected {}, item_count {})",
+                    node.header.magic, node.header.node_type, self.node_type, node.header.item_count
+                ),
+            ));
+        }
+
+        let max_items = if node.header.level == 0 {
+            Self::max_leaf_items()
+        } else {
+            Self::max_internal_items()
+        };
+        if node.header.item_count as usize > max_items {
+            eprintln!(
+                "Invalid BTree item_count (block {block_num}: item_count {} > max {}, level {}, dirty {})",
+                node.header.item_count, max_items, node.header.level, is_dirty
+            );
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "Invalid BTree item_count (block {block_num}: item_count {} > max {})",
+                    node.header.item_count, max_items
+                ),
+            ));
         }
 
         Ok(node)
@@ -308,9 +325,8 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
 
         loop {
             let node = self.read_node(ctx, current_block)?;
-            let count = node.header.item_count as usize;
-
             if node.header.level == 0 {
+                let count = (node.header.item_count as usize).min(Self::max_leaf_items());
                 // Leaf node
                 let items: &[KVPair<K, V>] = bytemuck::cast_slice(
                     &node.payload[..count * std::mem::size_of::<KVPair<K, V>>()],
@@ -321,6 +337,7 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
                     Err(_) => return Ok(None),
                 }
             } else {
+                let count = (node.header.item_count as usize).min(Self::max_internal_items());
                 // Internal node
                 // Payload structure: [u64; leftmost_child], [KPtrPair; count]
                 let leftmost_ptr: u64 = pod_read_unaligned(&node.payload[0..8]);
@@ -354,9 +371,8 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
 
         loop {
             let node = self.read_node(ctx, current_block)?;
-            let count = node.header.item_count as usize;
-
             if node.header.level == 0 {
+                let count = (node.header.item_count as usize).min(Self::max_leaf_items());
                 let items: &[KVPair<K, V>] = bytemuck::cast_slice(
                     &node.payload[..count * std::mem::size_of::<KVPair<K, V>>()],
                 );
@@ -370,6 +386,7 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
                     Err(idx) => return Ok(Some((items[idx - 1].key, items[idx - 1].value))),
                 }
             } else {
+                let count = (node.header.item_count as usize).min(Self::max_internal_items());
                 let leftmost_ptr: u64 = pod_read_unaligned(&node.payload[0..8]);
                 let items: &[KPtrPair<K>] = bytemuck::cast_slice(
                     &node.payload[8..8 + count * std::mem::size_of::<KPtrPair<K>>()],
@@ -441,6 +458,43 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
     where
         F: FnMut(&mut TxContext) -> Result<u64>,
     {
+        // FAST-INPLACE-UPDATE PATH: If key is within our cached leaf's [min_key, max_key] range,
+        // and it exists in the leaf, update in-place without descending the B-tree!
+        if let Some(rl) = self.range_leaf {
+            let safe_count = rl.item_count as usize;
+            if key >= rl.min_key
+                && key <= rl.max_key
+                && safe_count > 0
+                && rl.epoch == current_epoch()
+            {
+                if let Ok(node) = self.read_node(ctx, rl.leaf_block) {
+                    if node.header.level == 0
+                        && node.header.item_count as usize == safe_count
+                    {
+                        let barrier = cow_barrier_of(ctx);
+                        let leaf_frozen = barrier > 0
+                            && is_frozen_tree(self.node_type)
+                            && node.header.generation <= barrier;
+                        if !leaf_frozen {
+                            let old_items: &[KVPair<K, V>] = bytemuck::cast_slice(
+                                &node.payload[..safe_count * std::mem::size_of::<KVPair<K, V>>()],
+                            );
+                            if let Ok(idx) = old_items.binary_search_by(|kv| kv.key.cmp(&key)) {
+                                let mut node = node;
+                                let sz = std::mem::size_of::<KVPair<K, V>>();
+                                let at = idx * sz;
+                                let pair = KVPair { key, value };
+                                node.payload[at..at + sz].copy_from_slice(bytes_of(&pair));
+                                self.write_node(ctx, rl.leaf_block, &node)?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                self.range_leaf = None;
+            }
+        }
+
         // FAST-APPEND PATH (Phase 3.2). A monotone key (strictly
         // greater than the cached rightmost-leaf maximum), a not-full
         // leaf, and an unchanged structural epoch let us skip the root
@@ -518,7 +572,7 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
                 break n;
             }
 
-            let count = n.header.item_count as usize;
+            let count = (n.header.item_count as usize).min(Self::max_internal_items());
             let leftmost_ptr: u64 = pod_read_unaligned(&n.payload[0..8]);
             let items: &[KPtrPair<K>] =
                 bytemuck::cast_slice(&n.payload[8..8 + count * std::mem::size_of::<KPtrPair<K>>()]);
@@ -588,6 +642,15 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
                 node.payload[..bytes.len()].copy_from_slice(bytes);
                 self.write_node(ctx, current_block, &node)?;
                 self.refresh_fast_leaf_if_rightmost(current_block, rightmost, &items[count - 1], node.header.item_count);
+                if count > 0 {
+                    self.range_leaf = Some(RangeLeaf {
+                        leaf_block: current_block,
+                        min_key: items[0].key,
+                        max_key: items[count - 1].key,
+                        item_count: node.header.item_count,
+                        epoch: current_epoch(),
+                    });
+                }
                 return Ok(());
             }
             Err(idx) => idx,
@@ -607,6 +670,13 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
         node.payload[..bytes.len()].copy_from_slice(bytes);
         self.write_node(ctx, current_block, &node)?;
         self.refresh_fast_leaf_if_rightmost(current_block, rightmost, &items[count], node.header.item_count);
+        self.range_leaf = Some(RangeLeaf {
+            leaf_block: current_block,
+            min_key: items[0].key,
+            max_key: items[count].key,
+            item_count: node.header.item_count,
+            epoch: current_epoch(),
+        });
         Ok(())
     }
 
@@ -648,10 +718,20 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
         // global and conservative) is void until re-proven.
         bump_epoch();
         self.fast_leaf = None;
+        self.range_leaf = None;
         let right_block = allocate_block(ctx)?;
         let mut right_node = BTreeNodeData::new(0, self.node_type);
         right_node.header.next_leaf = leaf_node.header.next_leaf;
         right_node.header.prev_leaf = leaf_block;
+
+        if leaf_node.header.next_leaf != 0 {
+            if let Ok(mut old_next) = self.read_node(ctx, leaf_node.header.next_leaf) {
+                if old_next.header.prev_leaf == leaf_block {
+                    old_next.header.prev_leaf = right_block;
+                    let _ = self.write_node(ctx, leaf_node.header.next_leaf, &old_next);
+                }
+            }
+        }
 
         leaf_node.header.next_leaf = right_block;
 
@@ -717,7 +797,8 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
             // original root block number, so the root pointer held by
             // any caller stays valid for the life of the filesystem.
             let moved = allocate_block(ctx)?;
-            let moved_node = self.read_node(ctx, left_block)?;
+            let mut moved_node = self.read_node(ctx, left_block)?;
+            moved_node.header.parent_block = left_block;
 
             // Leaf-chain bookkeeping: if the old root was a leaf, the
             // right sibling's `prev_leaf` was set to `left_block` by
@@ -725,17 +806,17 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
             // point it there instead.
             if moved_node.header.level == 0 {
                 let mut right = self.read_node(ctx, right_block)?;
+                right.header.parent_block = left_block;
                 if right.header.prev_leaf == left_block {
                     right.header.prev_leaf = moved;
-                    self.write_node(ctx, right_block, &right)?;
                 }
+                self.write_node(ctx, right_block, &right)?;
             } else {
-                // The moved internal node's children record
-                // `parent_block == left_block`; reparent them to
-                // `moved`. (Nothing navigates via parent pointers today,
-                // but keeping them truthful costs little and keeps
-                // future debugging sane.)
-                let count = moved_node.header.item_count as usize;
+                let mut right = self.read_node(ctx, right_block)?;
+                right.header.parent_block = left_block;
+                self.write_node(ctx, right_block, &right)?;
+
+                let count = (moved_node.header.item_count as usize).min(Self::max_internal_items());
                 let leftmost: u64 = pod_read_unaligned(&moved_node.payload[0..8]);
                 let items: &[KPtrPair<K>] = bytemuck::cast_slice(
                     &moved_node.payload[8..8 + count * std::mem::size_of::<KPtrPair<K>>()],
@@ -914,6 +995,7 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
         // cache cannot survive them.
         bump_epoch();
         self.fast_leaf = None;
+        self.range_leaf = None;
         let mut path = Vec::new();
         // Phase 9: root-cell pickup (same rationale as insert).
         let mut current_block = self.view_root(ctx);
@@ -927,7 +1009,7 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
                 break n;
             }
 
-            let count = n.header.item_count as usize;
+            let count = (n.header.item_count as usize).min(Self::max_internal_items());
             let leftmost_ptr: u64 = pod_read_unaligned(&n.payload[0..8]);
             let items: &[KPtrPair<K>] =
                 bytemuck::cast_slice(&n.payload[8..8 + count * std::mem::size_of::<KPtrPair<K>>()]);
@@ -952,7 +1034,7 @@ impl<K: BTreeKey, V: BTreeItem> BTree<K, V> {
             current_block = *path.last().expect("descent path is non-empty");
         }
 
-        let count = node.header.item_count as usize;
+        let count = (node.header.item_count as usize).min(Self::max_leaf_items());
         let old_items: &[KVPair<K, V>] =
             bytemuck::cast_slice(&node.payload[..count * std::mem::size_of::<KVPair<K, V>>()]);
 

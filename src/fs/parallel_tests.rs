@@ -95,7 +95,7 @@ pub(crate) fn mkfs_image(path: &std::path::Path, size_mb: u64, compress: bool) {
     sb.version = crate::common::version::CURRENT_VERSION;
     sb.checksum = crate::utils::checksum::calculate_superblock_checksum(&sb);
 
-    let mut disk = Disk::create(path, size_mb * 1024 * 1024).unwrap();
+    let disk = Disk::create(path, size_mb * 1024 * 1024).unwrap();
     disk.write_block(0, bytemuck::bytes_of(&sb)).unwrap();
 
     // Bitmap: metadata + journal marked used, PLUS the in-range

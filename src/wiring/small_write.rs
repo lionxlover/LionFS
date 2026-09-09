@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn small_writes_route_to_the_log_large_to_the_tree() {
-        let mut r = SmallWriteRouter::new(Vec::new(), WindowPolicy::default());
+        let r = SmallWriteRouter::new(Vec::new(), WindowPolicy::default());
         assert_eq!(r.route(&[0u8; 100]), WriteRoute::RecordLog);
         assert_eq!(r.route(&[0u8; SMALL_FILE_MAX as usize]), WriteRoute::RecordLog);
         assert_eq!(r.route(&[0u8; SMALL_FILE_MAX as usize + 1]), WriteRoute::Tree);

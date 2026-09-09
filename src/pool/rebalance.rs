@@ -361,7 +361,6 @@ mod tests {
     #[test]
     fn convergence_over_rounds() {
         // Drive a skewed pool to balance by applying plans.
-        let p = RebalancePlanner::default();
         let mut cfg = RebalanceConfig::default();
         cfg.round_byte_budget = TB; // 1 TiB rounds to converge fast
         let p = RebalancePlanner::new(cfg);

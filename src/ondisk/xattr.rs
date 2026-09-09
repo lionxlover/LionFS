@@ -110,6 +110,7 @@ fn require_body(rest: &str, _full: &str, _ns: u8) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn ns_class_of(name: &str) -> u8 {
     classify_name(name).unwrap_or(NS_USER)
 }

@@ -1,0 +1,215 @@
+# extended-comparison.fio
+#
+# Extended FIO job file for LionFS vs competitors comparison.
+# Tests block sizes: 4K, 64K, 1M
+# Queue depths:      1, 32, 128
+# Patterns:         seq-write, seq-read, rand-write, rand-read, mixed
+#
+# All jobs share fseq.bin. seq-write-64k creates it first.
+# ---------------------------------------------------------------------------
+
+# ===== 4K BLOCK SIZE =====
+
+[rand-write-4k-qd1]
+description=Random 4K write, queue depth 1 (latency-sensitive)
+filename=fseq.bin
+rw=randwrite
+bs=4k
+iodepth=1
+numjobs=1
+direct=1
+ioengine=psync
+size=1g
+runtime=20
+time_based=1
+group_reporting=1
+
+[rand-write-4k-qd32]
+description=Random 4K write, queue depth 32 (standard benchmark)
+filename=fseq.bin
+rw=randwrite
+bs=4k
+iodepth=32
+numjobs=4
+direct=1
+ioengine=psync
+size=1g
+runtime=20
+time_based=1
+group_reporting=1
+
+[rand-write-4k-qd128]
+description=Random 4K write, queue depth 128 (saturation)
+filename=fseq.bin
+rw=randwrite
+bs=4k
+iodepth=128
+numjobs=16
+direct=1
+ioengine=psync
+size=1g
+runtime=20
+time_based=1
+group_reporting=1
+
+[rand-read-4k-qd1]
+description=Random 4K read, queue depth 1
+filename=fseq.bin
+rw=randread
+bs=4k
+iodepth=1
+numjobs=1
+direct=1
+ioengine=psync
+size=1g
+runtime=20
+time_based=1
+group_reporting=1
+
+[rand-read-4k-qd32]
+description=Random 4K read, queue depth 32
+filename=fseq.bin
+rw=randread
+bs=4k
+iodepth=32
+numjobs=4
+direct=1
+ioengine=psync
+size=1g
+runtime=20
+time_based=1
+group_reporting=1
+
+[rand-read-4k-qd128]
+description=Random 4K read, queue depth 128
+filename=fseq.bin
+rw=randread
+bs=4k
+iodepth=128
+numjobs=16
+direct=1
+ioengine=psync
+size=1g
+runtime=20
+time_based=1
+group_reporting=1
+
+# ===== 64K BLOCK SIZE =====
+
+[seq-write-64k]
+description=Sequential 64K write (streaming throughput)
+filename=fseq.bin
+rw=write
+bs=64k
+iodepth=16
+numjobs=1
+direct=1
+ioengine=psync
+size=1g
+runtime=20
+time_based=1
+group_reporting=1
+
+[seq-read-64k]
+description=Sequential 64K read (streaming throughput)
+filename=fseq.bin
+rw=read
+bs=64k
+iodepth=16
+numjobs=1
+direct=1
+ioengine=psync
+size=1g
+runtime=20
+time_based=1
+group_reporting=1
+
+[rand-write-64k-qd32]
+description=Random 64K write, queue depth 32
+filename=fseq.bin
+rw=randwrite
+bs=64k
+iodepth=32
+numjobs=4
+direct=1
+ioengine=psync
+size=1g
+runtime=20
+time_based=1
+group_reporting=1
+
+[rand-read-64k-qd32]
+description=Random 64K read, queue depth 32
+filename=fseq.bin
+rw=randread
+bs=64k
+iodepth=32
+numjobs=4
+direct=1
+ioengine=psync
+size=1g
+runtime=20
+time_based=1
+group_reporting=1
+
+# ===== 1M BLOCK SIZE =====
+
+[seq-write-1m]
+description=Sequential 1M write (peak streaming throughput)
+filename=fseq.bin
+rw=write
+bs=1m
+iodepth=4
+numjobs=1
+direct=1
+ioengine=psync
+size=2g
+runtime=20
+time_based=1
+group_reporting=1
+
+[seq-read-1m]
+description=Sequential 1M read (peak streaming throughput)
+filename=fseq.bin
+rw=read
+bs=1m
+iodepth=4
+numjobs=1
+direct=1
+ioengine=psync
+size=2g
+runtime=20
+time_based=1
+group_reporting=1
+
+# ===== MIXED READ/WRITE =====
+
+[mixed-4k-7030]
+description=70/30 read/write random mix, 4K blocks (database pattern)
+filename=fseq.bin
+rw=randrw
+rwmixread=70
+bs=4k
+iodepth=32
+numjobs=4
+direct=1
+ioengine=psync
+size=1g
+runtime=20
+time_based=1
+group_reporting=1
+
+[mixed-4k-5050]
+description=50/50 read/write random mix, 4K blocks (balanced)
+filename=fseq.bin
+rw=randrw
+rwmixread=50
+bs=4k
+iodepth=32
+numjobs=4
+direct=1
+ioengine=psync
+size=1g
+runtime=20
+time_based=1
+group_reporting=1

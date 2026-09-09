@@ -211,6 +211,7 @@ fn calendar_year_key(unix_secs: u64) -> u64 {
     y as u64
 }
 
+#[allow(dead_code)]
 fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }

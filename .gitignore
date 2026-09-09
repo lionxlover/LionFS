@@ -35,4 +35,12 @@ Thumbs.db
 *.img
 test_volumes/
 test_mount/
-mount.log
+# Benchmark runs, test mounts and logs
+benchmarks/fio/out/
+mnt/
+*.bin
+*.log
+deep_file_bench/
+.agent/
+.gemini/
+scratch/

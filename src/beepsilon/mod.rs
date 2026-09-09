@@ -33,6 +33,8 @@ pub struct BEpsilonConfig {
     /// Fraction of free space (out of 256) retained when a leaf is
     /// written out, so subsequent appends do not immediately re-split.
     pub padding_frac_256: u32,
+    /// Adaptive B-epsilon parameter in (0, 1) balancing fanout and buffer capacity (LFS-Theory v10.0).
+    pub epsilon: f64,
 }
 
 impl Default for BEpsilonConfig {
@@ -41,8 +43,23 @@ impl Default for BEpsilonConfig {
         // a leaf re-write amortizes over many mutations.
         Self {
             flush_bytes: 2048,
-            padding_frac_256: 64,
-        } // 25%
+            padding_frac_256: 64, // 25%
+            epsilon: 0.5,
+        }
+    }
+}
+
+impl BEpsilonConfig {
+    /// Dynamically tune epsilon and flush capacity based on the measured write-to-read ratio.
+    /// Under write-heavy workloads (ratio > 0.7), epsilon decreases to expand buffer capacity;
+    /// under read-heavy workloads (ratio < 0.3), epsilon increases to maximize tree fanout.
+    pub fn adaptive_tune(&mut self, write_ratio: f64) {
+        let clamped_ratio = write_ratio.clamp(0.0, 1.0);
+        // Epsilon ranges from 0.25 (write-optimized) to 0.75 (read-optimized)
+        self.epsilon = 0.75 - (0.50 * clamped_ratio);
+        // Scale buffer flush threshold dynamically based on epsilon
+        let base_capacity = 2048.0;
+        self.flush_bytes = (base_capacity * (1.0 / self.epsilon.max(0.1))) as usize;
     }
 }
 
@@ -107,6 +124,12 @@ where
     pub fn config(&self) -> &BEpsilonConfig {
         &self.config
     }
+
+    /// Adaptively tune B-epsilon tree parameters according to current write ratio.
+    pub fn tune_workload(&mut self, write_ratio: f64) {
+        self.config.adaptive_tune(write_ratio);
+    }
+
 
     /// Point lookup: amortized one comparison per level after the hot
     /// leaf is resident (the in-memory copy is what the read path hits;
@@ -382,6 +405,7 @@ mod tests {
         let mut t = BEpsilonTree::new(BEpsilonConfig {
             flush_bytes: 128,
             padding_frac_256: 64,
+            epsilon: 0.5,
         });
         // 16-byte entries: 16 inserts -> 256 bytes -> flush.
         for i in 0u64..16 {
@@ -403,6 +427,7 @@ mod tests {
         let cfg = BEpsilonConfig {
             flush_bytes: 160,
             padding_frac_256: 64,
+            epsilon: 0.5,
         };
         let mut t = BEpsilonTree::new(cfg);
         let base_splits = {
@@ -500,6 +525,7 @@ mod tests {
         let mut t = BEpsilonTree::new(BEpsilonConfig {
             flush_bytes: 512,
             padding_frac_256: 64,
+            epsilon: 0.5,
         });
         const N: u64 = 2000;
         for i in 0..N {

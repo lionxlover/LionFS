@@ -18,7 +18,7 @@ use crate::integrity::checksum_tree::{
     ChecksumTree, ChecksumTreeKey, ChecksumTreeValue, CHECKSUM_TREE_NODE_TYPE,
 };
 use crate::directory::tree::DirectoryTree;
-use crate::ondisk::serialization::{Inode, Superblock, BLOCK_SIZE};
+use crate::ondisk::serialization::{Inode, Superblock};
 use crate::transaction::manager::TransactionManager;
 use crate::transaction::transaction::TxContext;
 
@@ -62,13 +62,14 @@ impl CountingAlloc {
 /// exercised (the 3.3 protections for bare-context callers).
 struct CowEnv {
     disk: &'static mut Disk,
+    #[allow(dead_code)]
     tm: &'static TransactionManager,
     tx: &'static mut crate::transaction::transaction::Transaction,
 }
 
 fn setup(tag: &str) -> CowEnv {
     let path = std::env::temp_dir().join(format!("test_mcow_{tag}.img"));
-    let mut disk = Disk::create(&path, 1024 * 1024 * 16).unwrap();
+    let disk = Disk::create(&path, 1024 * 1024 * 16).unwrap();
     let sb = zero_sb();
     let tm: &'static TransactionManager = Box::leak(Box::new(TransactionManager::new(&sb)));
     let tx: &'static mut crate::transaction::transaction::Transaction =

@@ -59,7 +59,7 @@ fn xattr_roundtrip_persists_across_remount() {
     let listed = fs.listxattr( ino).expect("listxattr");
     assert!(listed.contains(&"user.mime_type".to_string()));
 
-    let mut fs = Arc::try_unwrap(fs).ok().expect("sole owner");
+    let fs = Arc::try_unwrap(fs).ok().expect("sole owner");
     destroy_any(fs);
 
     let fs = remount("p12_xattr_persist");
@@ -78,7 +78,7 @@ fn xattr_roundtrip_persists_across_remount() {
     );
     fs.removexattr( ino, "user.mime_type").expect("remove");
     assert_eq!(fs.getxattr( ino, "user.mime_type").expect("get"), None);
-    let mut fs = fs;
+    let fs = fs;
     destroy_any(fs);
 }
 
@@ -126,7 +126,7 @@ fn xattr_flags_and_namespace_rules() {
         errno_of(fs.removexattr( ino, "user.nope")),
         crate::pal::posix::ENODATA
     );
-    let mut fs = fs;
+    let fs = fs;
     destroy_any(fs);
 }
 
@@ -177,7 +177,7 @@ fn acl_access_evaluation_overrides_mode_bits() {
     let mode = fs.getattr( ino).expect("getattr").perm;
     assert_eq!(mode & 0o777, 0o640, "mode = owner 6 | (4&4)<<3 | 0");
 
-    let mut fs = fs;
+    let fs = fs;
     destroy_any(fs);
 }
 
@@ -207,7 +207,7 @@ fn acl_chmod_keeps_named_entries_and_resyncs_mode() {
     assert_eq!(acl.named_by_id(ACL_USER, 42).unwrap().perm, 0o7, "named entry survives chmod");
     let mode = fs.getattr( ino).expect("getattr").perm;
     assert_eq!(mode & 0o777, 0o640);
-    let mut fs = fs;
+    let fs = fs;
     destroy_any(fs);
 }
 
@@ -252,7 +252,7 @@ fn acl_default_inheritance_on_mkdir() {
     let mode = fs.getattr( dir.ino).expect("getattr").perm;
     assert_eq!(mode & 0o777, 0o740);
     let _ = root;
-    let mut fs = fs;
+    let fs = fs;
     destroy_any(fs);
 }
 
@@ -298,7 +298,7 @@ fn reflink_shares_blocks_and_redirects_writes() {
     let got_src = fs.read( src.ino, 8 * BLOCK_SIZE as u64, BLOCK_SIZE as u32).expect("read src");
     assert_eq!(got_src, src_expect[8 * BLOCK_SIZE..9 * BLOCK_SIZE], "source corrupted by clone write");
 
-    let mut fs = Arc::try_unwrap(fs).ok().expect("sole owner");
+    let fs = Arc::try_unwrap(fs).ok().expect("sole owner");
     destroy_any(fs);
 
     // Durability: remount, both sides keep their own views.
@@ -307,7 +307,7 @@ fn reflink_shares_blocks_and_redirects_writes() {
     assert_eq!(got_src, src_expect[8 * BLOCK_SIZE..9 * BLOCK_SIZE]);
     let got_dst = fs.read( dst.ino, 8 * BLOCK_SIZE as u64, BLOCK_SIZE as u32).expect("read dst");
     assert_eq!(got_dst, new_mid);
-    let mut fs = fs;
+    let fs = fs;
     destroy_any(fs);
 }
 
@@ -323,7 +323,7 @@ fn reflink_registry_record_and_feature_flag_persist() {
     assert_eq!(features & crate::common::version::FS_FEATURE_REFLINK, crate::common::version::FS_FEATURE_REFLINK);
     let clone_root = fs.core.sb().clone_tree_root;
     assert!(clone_root != 0);
-    let mut fs = fs;
+    let fs = fs;
     destroy_any(fs);
 
     // The registry survives remount with the record intact.
@@ -339,7 +339,7 @@ fn reflink_registry_record_and_feature_flag_persist() {
     let rec = tree.lookup(&mut ctx, &dst.ino).expect("lookup").expect("clone record present");
     assert_eq!(rec.source_id, src.ino);
     drop(ctx);
-    let mut fs = fs;
+    let fs = fs;
     destroy_any(fs);
 }
 
@@ -347,7 +347,7 @@ fn reflink_registry_record_and_feature_flag_persist() {
 
 /// mkfs over a 3-device RAID5 pool (the tool's sequence, test-sized).
 fn mkfs_pool(paths: &[std::path::PathBuf], size_mb: u64) -> Superblock {
-    use crate::pool::raid::{RaidEngine, RaidProfile};
+    use crate::pool::raid::RaidProfile;
     // The mkfs tool's usable-blocks arithmetic for RAID5 (rounded
     // down to whole stripe rows, conservative margin).
     let per_device = size_mb * 1024 * 1024 / BLOCK_SIZE as u64;
@@ -510,7 +510,7 @@ fn scrub_heals_raid5_bitrot_and_verifies() {
         .collect();
     let disk = Disk::open_pool(&paths, crate::pool::raid::RaidProfile::Raid5, 32)
         .expect("open pool");
-    let mut fs = LionFS::new(disk, paths[0].display().to_string()).expect("mount");
+    let fs = LionFS::new(disk, paths[0].display().to_string()).expect("mount");
     assert_eq!(fs.core.sb().raid_profile, sb_template.raid_profile);
     let file_ino = fs.create( 1, "data.bin", &mkcreate()).expect("create").ino;
     fs.write( file_ino, 0, &payload).expect("write");
@@ -594,12 +594,12 @@ fn conformance_battery_passes_on_a_populated_image() {
     fs.setxattr( a.ino, "user.tag", b"keeper", 0).expect("xattr");
     let c = fs.create(1, "c.bin", &mkcreate()).expect("create");
     fs.copy_file_range( b.ino, 0, c.ino, 0, u64::MAX).expect("reflink");
-    let mut fs = fs;
+    let fs = fs;
     destroy_any(fs);
 
     // Offline snapshot for the registry check.
     {
-        let mut disk = Disk::open(&test_path("p12_conformance")).unwrap();
+        let disk = Disk::open(&test_path("p12_conformance")).unwrap();
         let mut sb = read_pool_sb(&disk);
         disk.live_barrier.fetch_max(sb.last_snapshot_generation, std::sync::atomic::Ordering::AcqRel);
         let tm = crate::transaction::manager::TransactionManager::new(&sb);
@@ -641,12 +641,12 @@ fn conformance_battery_passes_on_a_populated_image() {
 #[test]
 fn mount_gate_refuses_unknown_feature_bits() {
     let fs = Arc::new(mount("p12_gate", 64));
-    let mut fs = fs;
+    let fs = fs;
     destroy_any(fs);
 
     // Set an UNKNOWN bit directly in every superblock slot.
     let path = test_path("p12_gate");
-    let mut disk = Disk::open(&path).unwrap();
+    let disk = Disk::open(&path).unwrap();
     let mut sb = read_pool_sb(&disk);
     sb.fs_features |= 1 << 40;
     sb.checksum = crate::utils::checksum::calculate_superblock_checksum(&sb);
@@ -684,11 +684,11 @@ fn send_recv_roundtrip_recreates_the_tree_on_a_fresh_image() {
         fs.write(f2.ino, 0, &vec![9u8; BLOCK_SIZE + 1000]).expect("write");
         fs.fsync( f1.ino, true).expect("fsync");
         fs.fsync( f2.ino, true).expect("fsync");
-        let mut fs = fs;
+        let fs = fs;
         destroy_any(fs);
     }
     {
-        let mut disk = Disk::open(&test_path(src_tag)).unwrap();
+        let disk = Disk::open(&test_path(src_tag)).unwrap();
         let mut sb = read_pool_sb(&disk);
         disk.live_barrier
             .fetch_max(sb.last_snapshot_generation, std::sync::atomic::Ordering::AcqRel);
@@ -769,7 +769,7 @@ fn send_recv_roundtrip_recreates_the_tree_on_a_fresh_image() {
         let spec = fs.read( spec_ino, 0, (BLOCK_SIZE + 1000) as u32).expect("read");
         assert_eq!(spec.len(), BLOCK_SIZE + 1000);
         assert!(spec.iter().all(|&b| b == 9));
-        let mut fs = fs;
+        let fs = fs;
         destroy_any(fs);
     }
 
@@ -782,7 +782,7 @@ fn send_recv_roundtrip_recreates_the_tree_on_a_fresh_image() {
     let rec = snap.get_snapshot(&mut ctx, 5).expect("get").expect("recorded");
     assert!(rec.generation > 0);
     drop(ctx);
-    let mut fs = fs;
+    let fs = fs;
     destroy_any(fs);
 }
 
@@ -790,7 +790,7 @@ fn parallel_mkfs(path: &std::path::Path, size_mb: u64) -> std::io::Result<()> {
     // Same sequence as parallel_tests::mkfs_image, exposed for the
     // recv fixture.
     let _ = std::fs::remove_file(path);
-    let mut disk = Disk::create(path, size_mb * 1024 * 1024)?;
+    let disk = Disk::create(path, size_mb * 1024 * 1024)?;
     let total_blocks = size_mb * 1024 * 1024 / BLOCK_SIZE as u64;
     let inode_count = 1024u64;
     let inode_blocks = inode_count * 256 / BLOCK_SIZE as u64 + 1;

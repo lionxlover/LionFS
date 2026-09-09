@@ -421,7 +421,7 @@ mod tests {
         f.flags |= 1 << 31;
         assert!(InodeV3::deserialize(&f.serialize()).is_none());
         // Inline length inconsistent with buffer.
-        let mut f = inline_file(2, b"abc");
+        let f = inline_file(2, b"abc");
         let mut wire = f.serialize();
         wire.truncate(wire.len() - 1);
         assert!(InodeV3::deserialize(&wire).is_none());
@@ -440,7 +440,7 @@ mod tests {
         wire.truncate(66);
         assert!(InodeV3::deserialize(&wire).is_none());
         // Inline size field lying about the payload length.
-        let mut f = inline_file(4, b"abcd");
+        let f = inline_file(4, b"abcd");
         let mut wire = f.serialize();
         wire[32] = 0xFF; // Corrupt a size byte.
         assert!(InodeV3::deserialize(&wire).is_none());

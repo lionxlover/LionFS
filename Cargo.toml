@@ -1,10 +1,10 @@
 [package]
 name = "lionfs"
-version = "3.6.0"
+version = "7.1.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Lion"]
-description = "LionFS 3.0: line-rate, media-aware, self-healing universal file system with QoS, Guardian AI ops, unlimited-capacity addressing (cross-platform: Linux, macOS, Windows)"
+description = "LionFS 7.1.0: Universe Zenith line-rate, media-aware storage architecture with Decoupled Structural State Machines (DSSM), B-epsilon cascades, and zero-allocation boundary RMW"
 repository = "https://example.invalid/lionfs"
 license = "MIT OR Apache-2.0"
 keywords = ["filesystem", "storage", "io-uring", "fuse", "zns"]
@@ -27,7 +27,7 @@ path = "src/lib.rs"
 # POSIX platforms (Linux, macOS, BSDs): FUSE mounting (Linux fuse / macOS
 # macFUSE via fuser 0.12) and the libc errno/ioctl/fcntl surface.
 [target.'cfg(unix)'.dependencies]
-fuser = { version = "0.12", default-features = false, features = ["abi-7-10"] }
+fuser = { version = "0.12", default-features = false, features = ["abi-7-31"] }
 libc = "0.2"
 
 # Linux-only: the io_uring submission plane (Pillar I, RFC-002 §3.1).

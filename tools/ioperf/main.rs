@@ -233,6 +233,7 @@ struct Env {
     dedupe_tree_root: u64,
     path: String,
     paths: Vec<String>,
+    #[allow(dead_code)]
     snapshot_tax: bool,
 }
 

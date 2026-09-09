@@ -86,7 +86,7 @@ mod tests {
         let (reclaimed, rounds, evacuations) = class.totals();
         assert_eq!((reclaimed, rounds, evacuations), (0, 0, 0));
         let _bridge = GuardianTelemetryBridge::new();
-        let mut router = SmallWriteRouter::new(Vec::new(), WindowPolicy::default());
+        let router = SmallWriteRouter::new(Vec::new(), WindowPolicy::default());
         assert_eq!(router.route(b"x"), WriteRoute::RecordLog);
     }
 }

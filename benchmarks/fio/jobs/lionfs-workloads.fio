@@ -7,7 +7,7 @@ iodepth=16
 direct=1
 ioengine=psync
 size=1g
-runtime=30
+runtime=15
 time_based=1
 group_reporting=1
 
@@ -20,7 +20,7 @@ iodepth=16
 direct=1
 ioengine=psync
 size=1g
-runtime=30
+runtime=15
 time_based=1
 group_reporting=1
 
@@ -33,7 +33,7 @@ iodepth=16
 direct=1
 ioengine=psync
 size=1g
-runtime=30
+runtime=15
 time_based=1
 group_reporting=1
 
@@ -46,7 +46,7 @@ iodepth=16
 direct=1
 ioengine=psync
 size=1g
-runtime=30
+runtime=15
 time_based=1
 group_reporting=1
 
@@ -60,32 +60,6 @@ iodepth=16
 direct=1
 ioengine=psync
 size=1g
-runtime=30
+runtime=15
 time_based=1
-group_reporting=1
-
-[create-delete]
-description=File create/unlink storm (metadata)
-filename=fc/
-rw=none
-nrfiles=2000
-file_size=4k
-
-[create]
-description=Create phase of the metadata storm
-rw=write
-bs=4k
-filename=fc/file.:file_nr:
-nrfiles=2000
-file_size=4k
-direct=1
-ioengine=psync
-group_reporting=1
-
-[delete]
-description=Unlink phase of the metadata storm
-stonewall
-rw=del
-nrfiles=2000
-filename=fc/file.:file_nr:
 group_reporting=1

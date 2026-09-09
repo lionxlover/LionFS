@@ -19,7 +19,7 @@ use std::time::SystemTime;
 
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 
 use super::{VfsAttr, VfsCreate, VfsError, VfsKind, VfsOps, VfsResult, VfsSetAttr};
@@ -78,8 +78,30 @@ fn now_or(t: TimeOrNow) -> SystemTime {
 }
 
 impl<T: VfsOps> Filesystem for FuseBridge<T> {
-    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> Result<(), libc::c_int> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> Result<(), libc::c_int> {
         self.inner.init();
+        // Maximise the FUSE write batch size so the kernel coalesces more
+        // sequential write() calls before delivering them to userspace.
+        // Default is ~128 KiB; 4 MiB gives 31× more data per FUSE round-trip,
+        // amortising the ~200 µs kernel↔user context-switch cost across a
+        // larger payload — directly lifting sequential write throughput.
+        // max_write must be a multiple of the page size (4096). Cap at 4 MiB
+        // to stay within what fuser's session buffer supports.
+        let max_write = 4 * 1024 * 1024u32; // 4 MiB
+        let _ = config.set_max_write(max_write);
+        // Also raise max_readahead for sequential reads — the kernel will
+        // issue larger read-ahead requests, giving us bigger per-call payloads
+        // and better throughput on sequential read workloads.
+        let max_readahead = 4 * 1024 * 1024u32; // 4 MiB
+        let _ = config.set_max_readahead(max_readahead);
+
+        // Modern Linux FUSE acceleration: big writes, async DIO, parallel dirops, readdirplus
+        let caps = fuser::consts::FUSE_BIG_WRITES
+            | fuser::consts::FUSE_ASYNC_DIO
+            | fuser::consts::FUSE_PARALLEL_DIROPS
+            | fuser::consts::FUSE_DO_READDIRPLUS
+            | fuser::consts::FUSE_AUTO_INVAL_DATA;
+        let _ = config.add_capabilities(caps);
         Ok(())
     }
 
@@ -211,6 +233,20 @@ impl<T: VfsOps> Filesystem for FuseBridge<T> {
         }
     }
 
+    fn open(&mut self, _req: &Request<'_>, _ino: u64, flags: i32, reply: ReplyOpen) {
+        #[cfg(target_os = "linux")]
+        let is_direct = (flags & libc::O_DIRECT) != 0;
+        #[cfg(not(target_os = "linux"))]
+        let is_direct = false;
+        // 1 << 6 is FOPEN_PARALLEL_DIRECT_WRITES (Linux 5.14+)
+        let open_flags = if is_direct {
+            fuser::consts::FOPEN_DIRECT_IO | (1 << 6)
+        } else {
+            fuser::consts::FOPEN_KEEP_CACHE
+        };
+        reply.opened(0, open_flags);
+    }
+
     fn create(
         &mut self,
         req: &Request,
@@ -218,7 +254,7 @@ impl<T: VfsOps> Filesystem for FuseBridge<T> {
         name: &OsStr,
         mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         let create = VfsCreate {
@@ -226,8 +262,17 @@ impl<T: VfsOps> Filesystem for FuseBridge<T> {
             uid: req.uid(),
             gid: req.gid(),
         };
+        #[cfg(target_os = "linux")]
+        let is_direct = (flags & libc::O_DIRECT) != 0;
+        #[cfg(not(target_os = "linux"))]
+        let is_direct = false;
+        let open_flags = if is_direct {
+            fuser::consts::FOPEN_DIRECT_IO | (1 << 6)
+        } else {
+            fuser::consts::FOPEN_KEEP_CACHE
+        };
         match self.inner.create(parent, &os_str_to_string(name), &create) {
-            Ok(attr) => reply.created(&self.inner.entry_ttl(), &to_file_attr(&attr, 4096), 0, 0, 0),
+            Ok(attr) => reply.created(&self.inner.entry_ttl(), &to_file_attr(&attr, 4096), 0, 0, open_flags),
             Err(e) => reply.error(e.errno),
         }
     }

@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn resolve_specific_time_ignores_now() {
-        let st = secs_to_system_time(500);
+        let _st = secs_to_system_time(500);
         assert_eq!(resolve_time_or_now(TimeOrNow::At(500), 12345), 500);
     }
 

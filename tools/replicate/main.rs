@@ -58,7 +58,7 @@ fn main() {
                 std::process::exit(1);
             }
             let snap_id: u64 = args[3].parse().expect("snapshot id must be numeric");
-            let mut disk = Disk::open(image).expect("open image");
+            let disk = Disk::open(image).expect("open image");
             let sb = read_sb(&disk);
             let count = {
                 let file = std::fs::File::create(&args[4]).expect("create stream file");

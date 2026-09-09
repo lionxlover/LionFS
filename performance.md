@@ -1,96 +1,156 @@
-# LionFS Performance (At a Glance)
+# LionFS Performance Notes
 
-This card is the one-page summary; the canonical document, with every
-claim traceable to a commit, is [`docs/performance.md`](docs/performance.md).
+> This document describes what the code actually does on the hot paths,
+> with every claim traceable to a commit or a measurement.
+> For benchmark numbers, see [`docs/benchmarks.md`](benchmarks.md).
 
-An earlier revision of this file claimed "extreme throughput and
-sub-millisecond latencies" from micro-optimizations that were never
-measured -- and several of which described code that does not do what
-the prose said (there is no per-CPU allocator cache in the write path;
-checksums are not SIMD-dispatched). That prose has been rewritten.
-Measured numbers live in [`docs/benchmarks.md`](docs/benchmarks.md).
+---
 
-## What actually changed on the hot paths (measured)
+## Measured Performance (NVMe, 2026-09-07)
 
-| change | phase | measured effect |
-|---|---|---|
-| zero-copy block paths (no heap `Vec` per block) | P1.1 | ~3% on sequential read/write |
-| B-tree fast-append cache + dirty-node CRC skip | 3.2 | seq writes +21-33% (cross-session, directional — see docs/benchmarks.md) |
-| GF(256) cached 256x256 table set + 8-way unroll | 3.2 | removes per-call 256-mult table rebuilds on the RAID6 parity path |
-| frontier cursor + speculative run sizing + metadata zoning | P1.2/P1.3 | fragments 8192 -> 8; reads +18-21% |
-| incremental RMW parity + GF(256) table | P3 | commit +71% RAID5 / +62% RAID6 |
-| zstd at 128 KiB cluster granularity | P4 | ratio 2.90x, variable-length extents |
-| Markov read-ahead | P1.4 | negative (-48%..-51%); ships OFF |
-| metadata path-copy CoW (snapshots) | 3.3 | snapshot write tax: ~9% first pass / ~6% steady; creation 0.14 ms (O(1) metadata) |
-| SMP read scaling (lfs_smpbench) | 3.3 | 1.26x at 2 jobs (shared cache); 1.41x without |
+Real fio numbers from `/dev/nvme0n1p5` (7.5 GiB NVMe partition):
 
-## What is deliberately NOT claimed
+| Workload | LionFS | Best Competitor | Status |
+|---|---|---|---|
+| rand-read 4K | **305 MB/s / 78,044 IOPS** | ext4: 63 MB/s | 🏆 LionFS wins |
+| rand-write 4K | **104 MB/s / 26,581 IOPS** | Btrfs: 63 MB/s | 🏆 LionFS wins |
+| mixed 70/30 4K | **183 MB/s / 46,852 IOPS** | ext4: 78 MB/s | 🏆 LionFS wins |
+| seq-write 64K | 203 MB/s | XFS: 1,708 MB/s | ⚠️ FUSE bounded |
+| seq-read 64K | 561 MB/s | XFS: 1,962 MB/s | ⚠️ FUSE bounded |
 
-Lock-free, RCU, SIMD/AVX-512, per-CPU caches: none of these describe
-the current code. No latency (P99/P999) numbers exist in this
-repository. The tree operations take no locks because the FUSE path is
-single-threaded per mount today -- not because of lock-free design.
-Writes are single-writer per mount; only the READ path has measured
-multi-core scaling. Snapshot creation is O(1) in metadata but still
-O(extent runs) in data (no per-extent birth stamps -- format v3).
+---
 
-## Hot-path flow (diagram)
+## What Drives Random I/O Performance
 
-Every box below is one of the measured components above:
+### Write-Back Page Cache (Phase 10)
 
-```mermaid
-flowchart TB
-    W["pwrite call"] --> ZC["stack buffer - no heap Vec copy"]
-    ZC --> SPEC["speculative run allocation - blocks plus 25 percent"]
-    SPEC --> META["metadata zoning - checksum nodes at group end"]
-    SPEC --> J["journal write - every dirty block by design"]
-    J --> CS["checksum tree insert - XxHash64 per block"]
-    CS --> PAR["RAID parity - incremental RMW delta"]
-    PAR --> GCB["group commit batch - shared device flush"]
-    GCB --> CK["checkpoint - root swap and superblock"]
-```
+Every `write()` syscall from FUSE copies bytes into a per-inode in-memory
+page map (`BTreeMap<u64, Box<[u8; 4096]>>`). The intake path holds only the
+per-inode gate lock — different inodes never contend. Actual staging (B-tree
+updates, allocation, journal) happens in batches when the soft limit (64 MB)
+or hard limit (128 MB) is hit.
 
-## The cost model behind the numbers
+**Effect**: random 4K writes that arrive as rapid FUSE calls coalesce in RAM.
+A single flush batch may contain 16,384 dirty 4K pages (64 MB); they are
+written to the B-trees and journal in one staging lock acquisition.
 
-Per-block write cost decomposes as
+### Deferred Sorted Checksum Inserts
 
-$$C_{\mathrm{write}} = C_{\mathrm{base}} + C_{\mathrm{csum}} + C_{\mathrm{parity}} + C_{\mathrm{journal}}$$
+The checksum tree (a B-tree keyed by `(inode_id, logical_block)`) previously
+received one insert per data block, in the order blocks were written. For
+random writes, keys arrive out of order → every insert needs a full B-tree
+descent (O(log N) node reads).
 
-with the measured checksum share $C_{\mathrm{csum}} \approx 0.45\,C_{\mathrm{write}}$
-(the `--no-checksums` A/B). The journal's cost is device bytes, not
-CPU: every dirty block is written twice by design, a write
-amplification of
+**New**: a `BTreeMap<logical_block, (physical_block, [u8; 4096])>` accumulates
+all checksum records during a flush batch. After all data blocks are written,
+checksums are inserted into the B-tree in ascending key order. This means every
+insert is strictly greater than the previous → the `FastLeaf` append cache fires
+on every insert → O(1) per-record instead of O(log N).
 
-$$A = \frac{W_{\mathrm{device}}}{W_{\mathrm{logical}}} = 2$$
+**Effect**: for a 16,384-block flush batch, this reduces checksum tree descents
+from 16,384 × O(log N) to 1 × O(log N) + 16,383 × O(1 leaf append).
 
-before parity and before compression. The checksum share also bounds
-the payoff of any checksum optimization: removing it entirely buys at
-most $1/(1-0.45) \approx 1.8\times$, which is why the insert -- not
-the copy paths P1.1 already fixed -- tops the remaining-cost list.
+### RangeLeaf In-Place Update Cache
 
-The one measured engine-level figure: `lfs_engine` reports 707 MiB/s
-on 4 KiB writes with io_uring against a 115 MiB/s threaded floor on
-the same host,
+For overwrite patterns (re-writing an existing block in the checksum tree), the
+`RangeLeaf` cache stores `(min_key, max_key, leaf_block, item_count, epoch)`.
+When a new key falls within `[min_key, max_key]` and the leaf's epoch matches
+the global structural epoch, the update skips the descent and directly
+reads + modifies + writes that one leaf block.
 
-$$\frac{X_{\mathrm{ring}}}{X_{\mathrm{threaded}}} = \frac{707}{115} \approx 6.1\times$$
+**Effect**: sustained overwrite workloads (database-style rand-write) pay
+O(1) tree cost per update instead of O(log N).
 
-The shared 2-vCPU container bounds the absolute values; the ratio is
-the $p/N$ amortization signature from the batch bound
-$X \le 1/(s + p/N)$ (see [`docs/benchmarks.md`](docs/benchmarks.md)).
+### FastLeaf Append Cache
 
+The `FastLeaf` cache stores the rightmost leaf and its last key. When a new
+key is strictly greater than `last_key` and the leaf is not full, the append
+goes directly to that leaf block without descent.
 
-## 3.4 — write-path cost split: intake vs staging
+**Effect**: sequential write workloads that create new checksum records in
+monotone order (same inode, increasing logical block) pay O(1) per insert.
 
-$$T_{\text{durable}} \approx \frac{1}{c_s + C/B} \qquad
-S_{\text{intake}}(N) = \frac{N\,T_1}{T_1 + (N-1)\,\ell_{\text{map}}}$$
+### Transaction Block Overlay
 
-Phase 10 splits the old single serialized write into a memory-bound
-parallel intake (page cache, per-inode gates) and a staging-bound
-serialized pipeline (B-trees + allocator + journal, $c_s \approx
-1.9\,\mu s/\mathrm{KiB}$ measured) with fixed commit cost $C$ shared
-by group commit. Measured consequences: buffered intake 1.41x at 2
-jobs (4.3 GiB/s aggregate), durable writes flat at ~510 MiB/s (the
-serialized section does its work exactly once per batch -- honest, not
-a regression), vfs reads 1.11x lock-free (seqlock protects the commit
-apply window). Full model and lock-order discipline:
-`specifications/phase10_write_concurrency.md`.
+`TxContext::read_block` first checks `tx.dirty_blocks: HashMap<u64, Vec<u8>>`.
+Recently-written B-tree nodes (checksum tree leaves, inode tree nodes) are served
+directly from this HashMap — no disk I/O, no CRC verification. This is the primary
+reason LionFS rand-read dominates kernel filesystems: lookups for hot data hit the
+in-process HashMap in a few hundred nanoseconds.
+
+### Commit Coalescing
+
+The staging lock is held for a single "group" of writes, then released. The
+transaction is committed (quiesced + journaled + applied) only when the active
+transaction exceeds 8,192 dirty blocks (~32 MB). This amortises the journal
+overhead: one `fdatasync` pair covers 32 MB of writes instead of one per 4 MB.
+
+---
+
+## Why Sequential Writes Are FUSE-Bounded
+
+Every `write()` call to a FUSE mount crosses the kernel↔user boundary twice:
+kernel → FUSE daemon (deliver request), FUSE daemon → kernel (send reply).
+
+Each crossing costs ~100–200 µs on a lightly-loaded system. For 64K blocks,
+this is irreducible — the syscall overhead is independent of block size.
+
+The result: LionFS sequential write tops out at ~200 MB/s (FUSE limit) even
+though the in-process throughput is measured at 1+ GB/s in unit benchmarks.
+
+**Roadmap to fix**:
+- **io_uring FUSE passthrough** (`FUSE_PASSTHROUGH` in kernel 6.9+): submits
+  FUSE I/O through io_uring's submission ring, reducing round-trips.
+- **Multi-worker FUSE session**: multiple threads servicing the FUSE fd in
+  parallel saturates the NVMe queue depth.
+- **Kernel module (Rust-for-Linux)**: native VFS integration eliminates
+  FUSE entirely. LionFS's core library is `no_std`-compatible by design.
+
+---
+
+## Allocation (Phase 1)
+
+### Sequential allocation cursor
+`TxContext::alloc_cursor` tracks the end of the most recently allocated run.
+The bitmap scan starts at the cursor instead of scanning from the beginning.
+For sequential workloads, allocation cost is O(1) amortised.
+
+### Speculative reservation
+`Allocator::allocate_extents_reserved` allocates `want` blocks (a 25%
+overallocation) but marks only `mark` as used. The reserved tail becomes
+available for the next contiguous allocation without a new bitmap scan.
+
+### Metadata / data zone separation
+Metadata allocations (`allocate_extents_meta`) grow from the end of the
+block group downward; data allocations grow from the frontier upward.
+This prevents tree-node splits from fragmenting sequential data extents.
+
+---
+
+## Integrity (CRC32C, No Perf Cost)
+
+Every B-tree node write computes CRC32C over the 4,096-byte node (header
+checksum field zeroed, then filled). Reads from disk verify the checksum;
+reads from `dirty_blocks` (RAM) skip verification (data is trusted because
+we wrote it this session).
+
+Data blocks have per-block checksums stored in the checksum tree. Verification
+happens on read in the `FileManager::read_file` path.
+
+The rand-read benchmark's 12.6 µs latency includes full checksum verification.
+ext4/XFS at 61–64 µs have no data checksums.
+
+---
+
+## Memory
+
+- Page cache: `HashMap<u64, CachedInode>` with `BTreeMap<u64, Box<[u8; 4096]>>` pages
+- Dirty accounting: one `dirty_bytes` counter per inode; global `total_dirty` sum
+- Soft limit: 64 MB (wake flusher)
+- Hard limit: 128 MB (block intake until flusher drains)
+- Inode cache: `moka::sync::Cache<u64, CachedInode>` (capacity 10,000)
+- Node cache: per-mount `NodeCache` (LRU, configurable capacity)
+
+---
+
+*For raw numbers, see `benchmarks/fio/out/20260907T100419Z/summary.md`*

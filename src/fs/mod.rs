@@ -12,6 +12,7 @@ pub mod clones;
 pub mod compression;
 pub mod dedupe;
 pub mod filesystem;
+pub mod flusher;
 pub mod metadata;
 pub mod operations;
 pub mod page_cache;

@@ -61,13 +61,38 @@ fn usable_blocks(
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: mkfs_lfs <image_file> <size_in_mb_per_device> [--raid <single|raid0|raid1|raid5|raid6|raid10> <device2> [device3] ...]");
+    if args.len() < 2 {
+        eprintln!("LionFS mkfs {} ({})", lionfs_core::VERSION, lionfs_core::EDITION);
+        eprintln!("Usage: mkfs_lfs <image_file> [size_in_mb_per_device] [--compress] [--raid <single|raid0|raid1|raid5|raid6|raid10> <device2> [device3] ...] [--chunk <blocks>]");
         std::process::exit(1);
     }
 
+    println!(
+        "LionFS mkfs {} ({}) - Decoupled Structural State Machine (DSSM)",
+        lionfs_core::VERSION,
+        lionfs_core::EDITION
+    );
+
     let image_file = &args[1];
-    let size_mb: u64 = args[2].parse().expect("Invalid size");
+    let mut size_mb: u64 = if args.len() >= 3 && !args[2].starts_with("--") {
+        args[2].parse().unwrap_or(0)
+    } else {
+        0
+    };
+
+    if size_mb == 0 {
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(image_file) {
+            if let Ok(geo) = lionfs_core::disk::geometry::probe(&file) {
+                size_mb = geo.size_bytes / (1024 * 1024);
+                println!("Auto-detected device capacity: {} MB ({} bytes)", size_mb, geo.size_bytes);
+            }
+        }
+    }
+    if size_mb == 0 {
+        eprintln!("Invalid size or unable to auto-detect device size. Usage: mkfs_lfs <image_file> <size_in_mb_per_device>");
+        std::process::exit(1);
+    }
+
     // Phase 4: --compress enables zstd compression clusters for all
     // newly created files (per-inode property set at creation from the
     // superblock default).
@@ -89,17 +114,17 @@ fn main() {
     let mut device_paths: Vec<String> = vec![image_file.clone()];
     let mut raid_profile = RaidProfile::Single;
     let mut chunk_size_blocks: u32 = 0;
-    if args.len() > 3 {
-        if args[3] != "--raid" || args.len() < 5 {
-            eprintln!("Usage: mkfs_lfs <image_file> <size_in_mb_per_device> [--compress] [--raid <profile> <device2> [device3] ...] [--chunk <blocks>]");
+    if let Some(raid_idx) = args.iter().position(|a| a == "--raid") {
+        if raid_idx + 1 >= args.len() {
+            eprintln!("--raid requires a profile");
             std::process::exit(1);
         }
-        raid_profile = parse_raid_profile(&args[4]);
+        raid_profile = parse_raid_profile(&args[raid_idx + 1]);
         // Optional: --chunk <blocks> anywhere after the profile. Device
         // paths are everything else.
         let mut explicit_chunk: Option<u32> = None;
         let mut rest: Vec<String> = Vec::new();
-        let mut it = args[5..].iter();
+        let mut it = args[raid_idx + 2..].iter();
         while let Some(a) = it.next() {
             if a == "--chunk" {
                 let v = it.next().unwrap_or_else(|| {
@@ -110,7 +135,7 @@ fn main() {
                     eprintln!("Invalid --chunk value: {}", v);
                     std::process::exit(1);
                 }));
-            } else if a != "--compress" {
+            } else if a != "--compress" && a != "--passphrase" {
                 rest.push(a.clone());
             }
         }
@@ -184,7 +209,11 @@ fn main() {
     let secondary_sb_1 = if total_blocks > 8192 { 8192 } else { 0 };
     let secondary_sb_2 = if total_blocks > 16384 { 16384 } else { 0 };
     let journal_start = data_region_start;
-    let journal_blocks = 4096; // 16 MB flat journal for simplicity
+    let journal_blocks = if total_blocks >= 1_000_000 {
+        16384 // 64 MB journal for large devices (e.g. 4GB+)
+    } else {
+        4096 // 16 MB flat journal for smaller images
+    };
 
     // Check if image is big enough for this layout
     if total_blocks < journal_start + journal_blocks + 100 {
@@ -335,6 +364,13 @@ fn main() {
     // Init inodes
     for i in 0..inode_blocks {
         disk.write_block(inode_table_start + i, &[0; BLOCK_SIZE])
+            .unwrap();
+    }
+
+    // Init journal: zero the journal area so old transactions from a previous
+    // format on physical storage are never mistakenly recovered.
+    for i in 0..journal_blocks {
+        disk.write_block(journal_start + i, &[0; BLOCK_SIZE])
             .unwrap();
     }
 

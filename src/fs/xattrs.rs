@@ -246,7 +246,7 @@ where
         return Err(Error::from_raw_os_error(crate::pal::posix::ENODATA));
     }
 
-    let mut to_free = vec![block];
+    let to_free = vec![block];
     if remaining.is_empty() {
         mgr.remove_record(ctx, ino, allocate)?;
     } else {

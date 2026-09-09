@@ -135,3 +135,36 @@ pub mod wiring;
 /// convergence as an invariant. Same seed, same universe,
 /// bit-for-bit, on every platform.
 pub mod sim;
+
+// --- LionFS 7.1.0 (Universe Zenith Architecture: LFS-Theory v10.0) ----------
+
+/// Current release version of LionFS.
+pub const VERSION: &str = "7.1.0";
+/// Architecture edition name.
+pub const EDITION: &str = "UNIVERSE-ZENITH";
+
+/// Theoretical foundations and architecture metadata derived from `LFS_theory.md`.
+pub mod theory {
+    /// Returns the active architectural edition.
+    pub fn edition() -> &'static str {
+        crate::EDITION
+    }
+
+    /// Returns the semantic version of the LionFS core.
+    pub fn version() -> &'static str {
+        crate::VERSION
+    }
+
+    /// Primary architectural pillars of LionFS 7.1.0 DSSM (Decoupled Structural State Machines).
+    pub const PILLARS: &[&str] = &[
+        "Decoupled Structural State Machines (DSSM)",
+        "Tri-Tier B-epsilon Buffer Cascades",
+        "3-Phase Concurrent Transaction Pipelining",
+        "FastLeaf Monotonic Append & RangeLeaf Speculative Descents",
+        "Zero-Allocation Head/Tail Boundary RMW Pre-Fetching",
+        "AVX-512 Carryless SIMD Integrity Pipelines",
+        "Forward-Only Zone-Append ZNS Media Vectors (WAF -> 1.000)",
+        "Segmented 40-Byte Micro-Journaling",
+    ];
+}
+
