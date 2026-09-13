@@ -6,14 +6,14 @@
 /* ---- Site configuration ------------------------------------------------- */
 const CONFIG = {
   repoUrl: "https://github.com/lionxlover/LionFS",
-  version: "3.8.0",
-  versionShort: "3.8",
-  releaseName: "The Throughput Release",
-  phase: "Phase 14",
+  version: "8.0.0",
+  versionShort: "8.0",
+  releaseName: "Unified",
+  phase: "8.0 Unified",
   license: "MIT OR Apache-2.0",
-  rustVersion: "1.75",
-  tests: 840,
-  tools: 57,
+  rustVersion: "1.89",
+  tests: 948,
+  tools: 53,
   updated: "2026",
 };
 
@@ -38,9 +38,8 @@ const HERO = {
   titleA: "The file system that",
   titleB: "heals itself.",
   lead:
-    "LionFS is a from-scratch, high-performance, <strong>self-healing universal file system</strong> written in Rust — " +
-    "line-rate io_uring throughput, O(1) snapshots, end-to-end checksums on every read, and QoS'd multi-tenancy, " +
-    "from <strong>one code base</strong> on Linux, macOS and Windows.",
+    "A from-scratch, <strong>self-healing file system</strong> in Rust — io_uring throughput, O(1) snapshots, " +
+    "checksummed reads, QoS'd multi-tenancy. <strong>One code base</strong>, Linux to Windows.",
   ctas: [
     { label: "Get started", href: "#quickstart", primary: true },
     { label: "View benchmarks", href: "#performance", primary: false },
@@ -56,7 +55,7 @@ const HERO = {
     title: "lion@storage — lionfs " + CONFIG.versionShort,
     lines: [
       { type: "cmd",  text: "cargo build --release --features io_uring" },
-      { type: "out",  text: "   Compiling lionfs v3.8.0" },
+      { type: "out",  text: "   Compiling lionfs v8.0.0" },
       { type: "cmd",  text: "sudo target/release/mkfs_lfs disk.img 1024" },
       { type: "out",  text: "   formatted 1024 MB · journal v2 · checksums: blake3" },
       { type: "cmd",  text: "sudo target/release/mount_lfs disk.img /mnt/lion" },
@@ -75,18 +74,18 @@ const TICKER = [
   "ZNS", "SMR", "CXL-PMEM", "BLAKE3", "zstd", "FastCDC", "dedup",
   "O(1) snapshots", "RS(n,k)", "WFQ 8:4:1", "Guardian", "128-bit addressing",
   "FUSE", "WinFsp", "checksummed reads", "group commit", "reflink",
+  "Raft consensus", "CRDT namespace", "convergent encryption", "time travel",
 ];
 
 /* ---- Honesty banner ------------------------------------------------------- */
 const HONESTY = {
   title: "Honest by design",
   text:
-    "LionFS is <strong>pre-alpha and unverified on real hardware</strong> — and every performance number on this site " +
-    "comes from a command <strong>you can re-run yourself</strong> (<code>lfs_versus</code>, medians of 3). " +
-    "No cross-filesystem number is quoted unless it was measured on the same host, in the same run.",
+    "<strong>Pre-alpha, unverified on real hardware.</strong> Every number here comes from " +
+    "<code>lfs_versus</code> (medians of 3) — <strong>re-runnable</strong>, same host, same run.",
   chips: [
-    { label: "840 tests · all green", cls: "good" },
-    { label: "pre-alpha 3.8", cls: "warn" },
+    { label: `${CONFIG.tests}+ tests · all green`, cls: "good" },
+    { label: `pre-alpha ${CONFIG.versionShort}`, cls: "warn" },
     { label: "numbers = re-runnable", cls: "acc" },
   ],
 };
@@ -386,9 +385,9 @@ const PERFORMANCE = {
       label: "NVMe (/dev/nvme0n1p5)",
       note: "Measured on real NVMe hardware (/dev/nvme0n1p5, 7.5 GiB), fio standard profiles, direct=1, ioengine=psync, runtime=15s, 2 runs median. Run: benchmarks/fio/run-comparison.sh. LionFS runs as FUSE userspace daemon.",
       rows: [
-        { wl: "Random Read 4 KiB (psync, direct=1)", unit: "MiB/s", lion: 304.86, ext4: 63.08, note: "🏆 5.1× faster than ext4. 78,044 vs 16,149 IOPS. 12.6 µs vs 61.5 µs latency. Includes full CRC32C verification." },
-        { wl: "Random Write 4 KiB (psync, direct=1)", unit: "MiB/s", lion: 103.83, ext4: 280.59, note: "🏆 Beats Btrfs (63.88 MB/s) by +56.6%. ext4/XFS win via kernel buffer cache with no checksums. LionFS: checksums + journal + page cache coalescing." },
-        { wl: "Mixed 70/30 R/W 4 KiB (psync, direct=1)", unit: "MiB/s", lion: 183.02, ext4: 78.77, note: "🏆 2.2× faster than ext4, 2.8× faster than Btrfs (63.58 MB/s). 46,852 vs 20,165 IOPS." },
+        { wl: "Random Read 4 KiB (psync, direct=1)", unit: "MiB/s", lion: 304.86, ext4: 63.08, note: `${icon("trophy")} 5.1× faster than ext4. 78,044 vs 16,149 IOPS. 12.6 µs vs 61.5 µs latency. Includes full CRC32C verification.` },
+        { wl: "Random Write 4 KiB (psync, direct=1)", unit: "MiB/s", lion: 103.83, ext4: 280.59, note: `${icon("trophy")} Beats Btrfs (63.88 MB/s) by +56.6%. ext4/XFS win via kernel buffer cache with no checksums. LionFS: checksums + journal + page cache coalescing.` },
+        { wl: "Mixed 70/30 R/W 4 KiB (psync, direct=1)", unit: "MiB/s", lion: 183.02, ext4: 78.77, note: `${icon("trophy")} 2.2× faster than ext4, 2.8× faster than Btrfs (63.58 MB/s). 46,852 vs 20,165 IOPS.` },
         { wl: "Sequential Read 64 KiB (psync, direct=1)", unit: "MiB/s", lion: 561.41, ext4: 1936.15, note: "FUSE round-trip overhead. LionFS in-process throughput >1 GB/s. Roadmap: io_uring FUSE passthrough." },
         { wl: "Sequential Write 64 KiB (psync, direct=1)", unit: "MiB/s", lion: 203.53, ext4: 1434.63, note: "FUSE bounded. XFS: 1,708 MB/s. Each 64K write crosses kernel↔user boundary twice (~200 µs). io_uring passthrough and kernel module on roadmap." },
       ],
@@ -415,9 +414,9 @@ const PERFORMANCE = {
       label: "vs Btrfs — random I/O",
       note: "Direct comparison: same device, same fio job file, same mount options. LionFS labeled as FUSE; Btrfs is kernel. Run script: benchmarks/fio/run-comparison.sh",
       rows: [
-        { wl: "Random Read 4 KiB", unit: "MiB/s", lion: 304.86, ext4: 47.24, note: "🏆 LionFS 6.2× faster. LionFS: 78,044 IOPS, 12.6 µs. Btrfs: 12,093 IOPS, 82.2 µs." },
-        { wl: "Random Write 4 KiB", unit: "MiB/s", lion: 103.83, ext4: 63.88, note: "🏆 LionFS +56.6% faster. LionFS: 26,581 IOPS, 40.8 µs. Btrfs: 16,352 IOPS, 59.5 µs." },
-        { wl: "Mixed 70/30 R/W 4 KiB", unit: "MiB/s", lion: 183.02, ext4: 63.58, note: "🏆 LionFS 2.8× faster. 46,852 vs 16,278 IOPS." },
+        { wl: "Random Read 4 KiB", unit: "MiB/s", lion: 304.86, ext4: 47.24, note: `${icon("trophy")} LionFS 6.2× faster. LionFS: 78,044 IOPS, 12.6 µs. Btrfs: 12,093 IOPS, 82.2 µs.` },
+        { wl: "Random Write 4 KiB", unit: "MiB/s", lion: 103.83, ext4: 63.88, note: `${icon("trophy")} LionFS +56.6% faster. LionFS: 26,581 IOPS, 40.8 µs. Btrfs: 16,352 IOPS, 59.5 µs.` },
+        { wl: "Mixed 70/30 R/W 4 KiB", unit: "MiB/s", lion: 183.02, ext4: 63.58, note: `${icon("trophy")} LionFS 2.8× faster. 46,852 vs 16,278 IOPS.` },
         { wl: "Sequential Write 64 KiB", unit: "MiB/s", lion: 203.53, ext4: 731.82, note: "Btrfs wins: CoW overhead but still kernel-native. LionFS FUSE bounded." },
         { wl: "Sequential Read 64 KiB", unit: "MiB/s", lion: 561.41, ext4: 1137.07, note: "Btrfs wins: kernel page cache vs FUSE round-trip." },
       ],
@@ -444,7 +443,7 @@ const PERFORMANCE = {
 /* ---- Comparison matrix ------------------------------------------------------ */
 
 const COMPARISON = {
-  systems: ["LionFS 3.8", "ext4", "XFS", "Btrfs", "ZFS", "NTFS", "ReFS", "APFS", "RedoxFS"],
+  systems: [`LionFS ${CONFIG.versionShort}`, "ext4", "XFS", "Btrfs", "ZFS", "NTFS", "ReFS", "APFS", "RedoxFS"],
   groups: [
     {
       group: "Integrity",
@@ -489,7 +488,7 @@ const COMPARISON = {
         { f: "Multi-tenant QoS on the data path", v: ["yes — 24-slot classes, dual token buckets, WFQ", "no · ionice only", "no", "no", "no · io throttling out-of-band", "no", "no", "no", "no"] },
         { f: "Capacity addressing", v: ["128-bit standard, 256-bit opt-in", "64-bit", "64-bit", "64-bit", "64-bit+", "64-bit", "128-bit · 16EB claim", "64-bit", "64-bit"] },
         { f: "Platforms from one code base", v: ["Linux / macOS / Windows · PAL; Windows = zero external crates", "Linux", "Linux", "Linux", "many · ports", "Windows", "Windows", "Apple", "Redox"] },
-        { f: "Field miles (the honest row)", v: ["pre-alpha, 840 tests, unverified on hardware", "millions of users", "millions of users", "millions of users", "millions of users", "millions of users", "enterprise", "billions of devices", "small"] },
+        { f: "Field miles (the honest row)", v: ["pre-alpha, 948+ tests, unverified on hardware", "millions of users", "millions of users", "millions of users", "millions of users", "millions of users", "enterprise", "billions of devices", "small"] },
       ],
     },
   ],
@@ -510,7 +509,9 @@ const RELEASES = [
   { ver: "3.5", name: "Pipelined transaction groups", tests: 760, major: true, desc: "Quiesce in microseconds, commit without the staging lock, lock-free readers — and O(1)-TOTAL snapshots via birth generations. The flake hunt found five real bugs; all fixed with regression tests.", hi: ["txg pipeline", "O(1) snapshots", "5 bugs fixed"] },
   { ver: "3.6", name: "POSIX completeness I", tests: 790, major: true, desc: "Xattrs + ACLs, reflink clones, the WIRED self-heal scrub, crypto/format agility, the Format Vault, snapshot send/recv.", hi: ["ACLs", "reflink", "self-heal", "Format Vault"] },
   { ver: "3.7", name: "POSIX access & the cache plane", tests: 823, major: true, desc: "Symlinks, .lion/snapshots/ browsing, non-destructive rollback, incremental send, sparse files, dentry + read caches (10.3× warm), quotas, verity seals.", hi: ["snapshot access", "cache plane", "rollback"] },
-  { ver: "3.8", name: "The throughput release", tests: 840, major: true, current: true, desc: "WAL v2, ZFS-mode data elision, the shared node cache, batched checksum staging, inode durability. +59% seq writes, +38% cold reads, one severe corruption window closed by construction.", hi: ["WAL v2", "elision", "node cache", "840 tests"] },
+  { ver: "3.8", name: "The throughput release", tests: 840, major: true, desc: "WAL v2, ZFS-mode data elision, the shared node cache, batched checksum staging, inode durability. +59% seq writes, +38% cold reads, one severe corruption window closed by construction.", hi: ["WAL v2", "elision", "node cache", "840 tests"] },
+  { ver: "7.1", name: "Universe Zenith", tests: 790, minor: true, desc: "The LFS-only lineage's last solo release before the merge below: DSSM, B-epsilon cascades, RangeLeaf/FastLeaf, 10,000+ tuning passes. 57,700 lines, benchmarked on physical NVMe.", hi: ["DSSM", "790 tests"] },
+  { ver: "8.0", name: "Unified — the LFS × HFS merge", tests: 948, major: true, current: true, desc: "LionFS (7.1, single-node engine) merges with HelixFS 1.1 (distributed: Raft consensus, CRDT namespace, CDC dedup, convergent encryption, RS erasure coding, WAL/checkpoint recovery, version-DAG time travel) into one workspace — 5 engine-level bridges, 2 real data-loss bugs found and fixed in the merge hunt. 948+ tests, all green.", hi: ["lionfs-cluster", "Raft", "time travel", "948+ tests", "2 bugs fixed"] },
 ];
 
 /* ---- Guardian ------------------------------------------------------------------ */

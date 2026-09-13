@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <title>LionFS 3.8 — Line-rate, self-healing universal file system, written in Rust</title>
+  <title>LionFS 8.0 — Line-rate, self-healing, distributed file system, written in Rust</title>
 
   <!-- Primary meta -->
   <meta name="description" content="LionFS is a from-scratch, high-performance, self-healing universal file system written in Rust. Line-rate io_uring throughput, O(1) snapshots, end-to-end checksums, QoS multi-tenancy, and cross-platform operation from one code base." />
@@ -14,11 +14,11 @@
 
   <!-- Open Graph -->
   <meta property="og:type" content="website" />
-  <meta property="og:title" content="LionFS 3.8 — The throughput release" />
-  <meta property="og:description" content="A from-scratch, self-healing universal file system in Rust: io_uring engine, O(1) snapshots, 840 tests, one code base for Linux, macOS and Windows." />
+  <meta property="og:title" content="LionFS 8.0 — Unified" />
+  <meta property="og:description" content="A from-scratch, self-healing file system in Rust: the single-node io_uring engine merged with a distributed plane (Raft, CRDT, CDC dedup, RS erasure coding, time travel), 948+ tests, for Linux, macOS and Windows." />
   <meta property="og:site_name" content="LionFS" />
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="LionFS 3.8 — The throughput release" />
+  <meta name="twitter:title" content="LionFS 8.0 — Unified" />
   <meta name="twitter:description" content="Line-rate, self-healing, universal file system written in Rust." />
 
   <!-- Favicon (inline SVG — no extra asset needed) -->
@@ -27,7 +27,14 @@
   <!-- Fonts (graceful system-font fallback if unavailable) -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin />
+  <link
+    rel="stylesheet"
+    href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+    crossorigin="anonymous"
+    referrerpolicy="no-referrer"
+  />
 
   <!-- Styles -->
   <link rel="stylesheet" href="css/main.css" />
@@ -48,7 +55,7 @@
     "applicationCategory": "DeveloperApplication",
     "operatingSystem": "Linux, macOS, Windows",
     "description": "A from-scratch, high-performance, self-healing universal file system written in Rust.",
-    "softwareVersion": "3.8",
+    "softwareVersion": "8.0",
     "license": "https://opensource.org/licenses/MIT",
     "url": "https://lionxlover.github.io/LionFS/",
     "codeRepository": "https://github.com/lionxlover/LionFS"
@@ -80,7 +87,7 @@
   <footer class="site-footer" id="siteFooter"><!-- footer injected by js/components.js --></footer>
 
   <button class="back-to-top" id="backToTop" aria-label="Back to top" title="Back to top">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+    <i class="ic fa-solid fa-arrow-up" aria-hidden="true"></i>
   </button>
 
   <noscript>

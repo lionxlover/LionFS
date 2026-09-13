@@ -1,0 +1,31 @@
+[package]
+name = "lionfs-cluster"
+version = "8.0.0"
+edition = "2021"
+rust-version = "1.89"  # std file locking (MountGuard)
+license = "MIT OR Apache-2.0"
+authors = ["LionFS Project"]
+description = "LionFS 8.0 cluster plane: Raft consensus, CRDT namespace, CDC dedup, Reed-Solomon erasure coding, WAL recovery, convergent encryption, and version-DAG time travel (merged from HelixFS)"
+keywords = ["filesystem", "distributed", "raft", "erasure-coding", "dedup"]
+categories = ["filesystem", "os"]
+
+[lib]
+name = "lionfs_cluster"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+blake3 = "1.5"
+zstd = "0.13"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+crc32fast = "1.3"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.10"

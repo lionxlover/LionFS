@@ -37,15 +37,16 @@ function renderNav() {
   <nav class="nav-links" aria-label="Primary">${links}</nav>
   <div class="nav-actions">
     <button class="btn-icon theme-toggle" id="themeToggle" aria-label="Toggle color theme" title="Toggle theme">
-      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 13A9 9 0 1 1 11 3a7 7 0 0 0 10 10z"/></svg>
-      <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.5"/><path d="M12 19.5V22"/><path d="m4.9 4.9 1.8 1.8"/><path d="m17.3 17.3 1.8 1.8"/><path d="M2 12h2.5"/><path d="M19.5 12H22"/><path d="m4.9 19.1 1.8-1.8"/><path d="m17.3 6.7 1.8-1.8"/></svg>
+      <i class="ic icon-moon fa-solid fa-moon" aria-hidden="true"></i>
+      <i class="ic icon-sun fa-solid fa-sun" aria-hidden="true"></i>
     </button>
     <a class="nav-gh" href="${gh()}" target="_blank" rel="noopener noreferrer" aria-label="LionFS on GitHub">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.9a3.4 3.4 0 0 0-1-2.6c3-.3 6.2-1.5 6.2-6.7a5.2 5.2 0 0 0-1.4-3.6 4.9 4.9 0 0 0-.1-3.7s-1.2-.4-3.9 1.5a13.4 13.4 0 0 0-7 0C6.1 1.7 4.9 2.1 4.9 2.1a4.9 4.9 0 0 0-.1 3.7A5.2 5.2 0 0 0 3.4 9.4c0 5.2 3.2 6.4 6.2 6.7a3.4 3.4 0 0 0-1 2.6V22"/><path d="M12 8v8"/><path d="M8.5 11.5h7"/></svg>
+      <i class="ic fa-brands fa-github" aria-hidden="true"></i>
       <span class="gh-label">GitHub</span>
     </a>
     <button class="hamburger" id="hamburger" aria-expanded="false" aria-controls="navDrawer" aria-label="Open menu">
-      <span></span><span></span><span></span>
+      <i class="ic fa-solid fa-bars icon-menu-open" aria-hidden="true"></i>
+      <i class="ic fa-solid fa-xmark icon-menu-close" aria-hidden="true"></i>
     </button>
   </div>`;
 }
@@ -63,7 +64,7 @@ function renderDrawer() {
         <span class="brand-name">Lion<em>FS</em></span>
       </a>
       <button class="btn-icon" id="drawerClose" aria-label="Close menu">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6 6 18"/></svg>
+        <i class="ic fa-solid fa-xmark" aria-hidden="true"></i>
       </button>
     </div>
     <nav>${links}</nav>
@@ -190,7 +191,7 @@ function renderPillars() {
     {
       eyebrow: "The 2.0 architecture · LFS-RFC-002",
       title: "Five pillars, one request path",
-      lead: "Everything below is implemented and wired into the live path — each pillar carries unit and property tests, and the tools exercise them on real images. <code>src/wiring/</code> puts every 3.0 policy layer on the exact path it governs.",
+      lead: "Implemented and wired into the live path — every pillar carries unit and property tests, exercised by the tools on real images. <code>src/wiring/</code> puts each policy layer on the exact path it governs.",
     },
     `<div class="pillars-grid">${cards}</div>`
   );
@@ -221,7 +222,7 @@ function renderCapabilities() {
       center: true,
       eyebrow: "Beyond the pillars · RFC-004 and Phase 14",
       title: `What ${CONFIG.versionShort} actually ships`,
-      lead: "The 3.0 additions were consultative; 3.1 wired them onto the live paths; 3.2–3.8 hardened, measured and accelerated them. These are the subsystems — and the honest numbers they produced.",
+      lead: "The subsystems below the pillars — and the honest numbers they produced.",
     },
     `<div class="bento">${tiles}</div>`
   );
@@ -242,7 +243,7 @@ function renderArchitecture() {
       <span class="name">${esc(l.name)}<small>${esc(l.sub)}</small></span>
       <span class="chev">${icon("chevRight")}</span>
     </button>
-    <div class="arch-flow" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="m6 13 6 6 6-6"/></svg></div>`
+    <div class="arch-flow" aria-hidden="true"><i class="ic fa-solid fa-chevron-down"></i></div>`
     )
     .join("");
 
@@ -483,7 +484,7 @@ function renderComparison() {
     {
       eyebrow: "Feature parity · code-verifiable",
       title: "LionFS vs the field",
-      lead: "Qualitative rows — verifiable by reading the code — against ext4, XFS, Btrfs, ZFS, NTFS, ReFS, APFS and RedoxFS. The last row is the one that matters. Scroll sideways for all nine systems.",
+      lead: "Qualitative rows, verifiable in the code, against ext4, XFS, Btrfs, ZFS, NTFS, ReFS, APFS and RedoxFS. The last row is the one that matters.",
     },
     `
     <div class="cmp-filters" data-reveal>${chips}</div>
@@ -532,7 +533,7 @@ function renderReleases() {
   return sectionShell(
     "releases",
     {
-      eyebrow: "245 → 462 → … → 840 tests",
+      eyebrow: "245 → 462 → … → 948 tests",
       title: "The release line",
       lead: "Every checkbox flips only with the full suite green — the count has only ever moved up. Each release below is a design record in the repo, with the measurements to back it.",
     },
@@ -620,7 +621,7 @@ function renderTools() {
     {
       eyebrow: `${TOOLS.featured.length} featured of ${CONFIG.tools} binaries`,
       title: "The toolbox",
-      lead: "Every tool runs against real images through the real mount path — and the changelog names the ones that used to be placeholders, because a tool that prints success without touching the device is a bug, not a feature.",
+      lead: "Every tool runs against real images through the real mount path. The changelog names the ones that used to be placeholders — a tool that prints success without touching the device is a bug.",
     },
     `
     <div class="tools-bar" data-reveal>
@@ -677,7 +678,7 @@ function renderQuickstart() {
   return sectionShell(
     "quickstart",
     {
-      eyebrow: "Six steps · Rust 1.75+",
+      eyebrow: "Six steps · Rust 1.89+",
       title: "From clone to crash-proven",
       lead: "Build it, run the suite, format an image, mount it — then let the crash simulator argue with the hardware on your behalf. See <code>BUILD.md</code> for per-platform details.",
     },

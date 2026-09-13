@@ -78,7 +78,11 @@ storage efficiency):
   construction used by Jerasure/Backblaze-class libraries. (A naive
   row-reduction of the transposed layout silently destroys the parity
   rows; this was found and fixed during implementation, documented
-  here so it stays fixed.)
+  here so it stays fixed.) The matrix depends on nothing but `(n, k)`,
+  so `RsCode::new` builds it once and caches it — `encode` and
+  `reconstruct` no longer redo the k×k inversion and n×k×k multiply
+  on every call, which was the actual per-write and per-repair cost
+  for a fixed code profile.
 - Data shards pass through (systematic top); parity shards are
   table-driven XOR folds.
 - Reconstruction solves the k×k GF(256) system over the surviving

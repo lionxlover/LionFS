@@ -17,7 +17,7 @@ sequenceDiagram
     CI->>CI: Build and test on Linux, macOS, Windows
     CI-->>C: Green suite or failures to fix
     C->>C: Address review comments
-    M->>G: Review against the 2.0-specific rules
+    M->>G: Review against project conventions
     M->>G: Sign-off, merge
 ```
 
@@ -31,16 +31,20 @@ If this is something you think you can fix, then fork LionFS and create a branch
 
 ## Get the test suite running
 
-The 2.0 tree is cross-platform (Linux, macOS, Windows). Prerequisites:
-- Rust 1.75+ (latest stable recommended)
+LionFS 8.0 is a 3-crate workspace (`lionfs` the local engine, MSRV
+1.83; `lionfs-cluster` the distributed plane, MSRV 1.89 for std file
+locking; `lionfs-cli` the `lion` front-end), cross-platform (Linux,
+macOS, Windows). Prerequisites:
+- Rust 1.89+ for the full workspace (latest stable recommended); the
+  engine crate alone floors at 1.83 if you're only building `lionfs`
 - Linux: nothing for tests; `libfuse3-dev` only for mount experiments
 - macOS: [macFUSE](https://osxfuse.github.io/) only for mount experiments
 - Windows: only the Rust toolchain (MSVC)
 
 To build and run tests:
 ```bash
-cargo test                      # portable suite (462 tests)
-cargo test --features io_uring  # Linux: with the ring backend
+cargo test --workspace           # full suite (948+ tests as of 8.0)
+cargo test --features io_uring   # Linux: with the ring backend
 cargo build --all-targets
 cargo clippy --lib --bins -- -D warnings   # the CI lint gate
 ```

@@ -1,5 +1,88 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+- `wiring::small_write::drain()`: checkpoint drain cloned every
+  buffered payload twice (once collecting the overlay, once per
+  record building the sink's `LogEntry`) — now moves each `Vec<u8>`
+  into the `LogEntry` instead of re-cloning it, halving the
+  byte-copying on every checkpoint. The one remaining clone (of the
+  overlay's current entries) is load-bearing: `self.overlay` must
+  survive untouched if `mark_checkpoint` fails, so a retry has
+  something to drain again.
+- `wiring::tar_stream`: header parsing on the tar import path
+  (`parse_octal`, `header_checksum`, `header_name`) allocated a
+  `Vec<u8>` per octal field, branched per-byte over all 512 header
+  bytes to special-case an 8-byte field, and always allocated two
+  owned `String`s for the name even when the ustar prefix field is
+  empty (the common case). All three are now allocation-minimal —
+  `parse_octal` is a single pass with no intermediate `Vec`,
+  `header_checksum` sums flat slices instead of branching per byte,
+  and `header_name` allocates one `String` in the no-prefix case.
+  Verified byte-for-byte identical output against the originals
+  across edge cases (all-zero/all-`0xFF` headers, octal-boundary
+  digit strings, empty/prefix-only/both-present name compositions).
+- `pool::erasure::RsCode`: `encode()` and `reconstruct()` each
+  rebuilt the systematic encoding matrix from scratch on every call
+  — a k×k GF(256) matrix inversion (O(k³)) plus an n×k×k multiply
+  (O(n·k²)) — even though the matrix is a pure function of `(n, k)`.
+  The matrix is now computed once in `RsCode::new` and cached on the
+  value; `encode`/`reconstruct` borrow it. (The cluster plane's
+  independent `ecc::RsCodec` already cached its matrix the same way —
+  this brings the local engine's implementation in line.) `RsCode` is
+  therefore `Clone` but no longer `Copy`/`PartialEq`; verified no call
+  site depended on either.
+
+## 8.0.0 — Unified (the LFS × HFS merge)
+
+The HelixFS (HFS) distributed plane merges into LionFS as the
+`lionfs-cluster` crate, with five engine-level bridges, six real/new
+tools, and two data-loss bugs found and fixed during the merge hunt.
+See MERGE.md for the full report.
+
+### Merged
+- Workspace: `lionfs` (local engine, 59 tools) + `lionfs-cluster`
+  (Raft, CRDT, CDC dedup, convergent crypto, RS EC, WAL, version-DAG
+  time travel — the 14-crate HFS port, all tests kept) +
+  `lionfs-cli` (`lion` front-end: info/mount/guide + git-style
+  dispatch).
+- `fs::timetravel`: resolve(path, t), read_file_at, list_dir_at,
+  diff over frozen snapshot trees (`lfs_timetravel` tool).
+- `guardian::reliability`: RAID-profile → (k,m,groups) mapping onto
+  the corrected CTMC MTTDL + availability + WA models, Prometheus
+  exposition (`lfs_predict` — formerly a stub).
+- `pipeline::cdc_dedup`: FastCDC + domain-scoped convergent
+  identities + the cluster DedupIndex; live-image reads
+  (`lfs_dedupe` — formerly a stub).
+- `pool::ec_volume`: RS fragment volumes (encode/reconstruct/verify,
+  CRC framing, dual-codec interop proof) (`lfs_raid`,
+  `lfs_verify` — formerly stubs).
+- `lfs_cluster`: the one-command showcase (Raft failover, CDC dedup,
+  convergent encryption, RS self-healing, time travel).
+
+### Fixed
+- Cluster plane: concurrent-mount checkpoint race (the flaky
+  `concurrent_reader_threads_share_an_engine` in the ORIGINAL HFS
+  code) — exclusive `MountGuard` file lock across the mount/create
+  critical section; the empty-checkpoint WAL fallback stays
+  (crash-safe by design).
+- Local engine: silent fsync loss on grow-overwrite remount —
+  tx-id reuse across sessions (in-place commits never persisted their
+  id; `begin()`'s pre-increment reuse; recovery's duplicate-id
+  overwrite). Fix: mount-time generation checkpoint (the HFS
+  "replay, then checkpoint" WAL discipline), id floor above
+  highest_tx, destroy-time tx floor, first-scanned-wins duplicate
+  handling. Regression: fsync_grow_overwrite_survives_{clean,crash} +
+  repeated_remount_grow_overwrites_never_revert.
+
+### Tooling
+- `lion` front-end; `lfs_timetravel` (new); `lfs_predict`,
+  `lfs_dedupe`, `lfs_raid`, `lfs_verify` (stub → real); README/BUILD
+  rewritten for the workspace; MERGE.md added.
+
+---
+
 All notable changes to the LionFS project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).

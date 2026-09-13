@@ -1,5 +1,8 @@
 [toolchain]
-# The floor is rust-version = "1.75" in Cargo.toml; CI and dev use
-# current stable. Nightly is exercised by the canary workflow only.
+# The floor is rust-version = "1.89" (crates/lionfs-cluster, for std
+# file locking in MountGuard) — the highest rust-version across the
+# workspace's member crates, since a `cargo build --workspace` needs
+# all of them. CI and dev use current stable. Nightly is exercised by
+# the canary workflow only.
 channel = "stable"
 profile = "default"

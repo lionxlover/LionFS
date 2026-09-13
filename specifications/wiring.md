@@ -119,7 +119,12 @@ the 3.0 `RecordLog` lacked on the live path:
 - **Checkpoint drain**: when the log's `checkpoint_due` fires, the
   overlay drains through a caller-supplied sink (the transaction
   layer's tree-insert path), in global sequence order — the tree
-  observes exactly the op order a post-crash replay would apply.
+  observes exactly the op order a post-crash replay would apply. The
+  overlay's entries are cloned once for the drain (so `self.overlay`
+  survives untouched if the subsequent `mark_checkpoint` fails and a
+  retry needs something to drain again), but each payload moves
+  straight from that clone into the sink's `LogEntry` — no second
+  clone of the bytes themselves.
 
 The window amortization, for $n$ records of average size
 $\bar p$ against bandwidth $B$ and fixed per-op cost $c$:

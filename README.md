@@ -1,20 +1,29 @@
-# LionFS (v7.1.0: Universe Zenith)
+# LionFS (v8.0.0: Unified — the LFS × HFS merge)
 
-**LionFS 7.1.0** is a from-scratch, high-performance, self-healing universal
-file system written in Rust, built upon the **Decoupled Structural State Machine (DSSM)**
-architecture and formal theoretical foundations established in [`LFS_theory.md`](LFS_theory.md).
-Targeting **line-rate throughput, sub-microsecond latency, zero-allocation boundary RMW,
-adaptive B-epsilon cascades, autonomous resilience, and cross-platform operation** (Linux, macOS, Windows).
+**LionFS 8.0 "Unified"** is a from-scratch, high-performance, self-healing
+universal file system written in Rust, built upon the **Decoupled Structural
+State Machine (DSSM)** architecture and formal theoretical foundations
+established in [`LFS_theory.md`](LFS_theory.md). Targeting **line-rate
+throughput, sub-microsecond latency, zero-allocation boundary RMW, adaptive
+B-epsilon cascades, autonomous resilience, and cross-platform operation**
+(Linux, macOS, Windows) — and, as of 8.0, a full **distributed plane**
+merged from HelixFS: Raft consensus, CRDT namespace, CDC dedup with
+convergent encryption, Reed-Solomon erasure coding, and path-based time
+travel. See [`MERGE.md`](MERGE.md) for exactly what merged, how, and the
+two data-loss bugs the merge hunt fixed.
 
-**Status: Production-grade architecture, verified on physical NVMe hardware (`/dev/nvme0n1p5`).**
-The engine compiles and its test suite is green on Linux (with and without io_uring); macOS/Windows
-are compile-clean by construction (the PAL carries all platform differences). Complete theoretical
-proofs and algorithms are specified in [`LFS_theory.md`](LFS_theory.md).
+**Status: Production-grade architecture, verified on physical NVMe hardware
+(`/dev/nvme0n1p5`).** The engine compiles and its test suite (948+ tests
+across the local and cluster planes) is green on Linux (with and without
+io_uring); macOS/Windows are compile-clean by construction (the PAL carries
+all platform differences). Complete theoretical proofs and algorithms are
+specified in [`LFS_theory.md`](LFS_theory.md).
 
-Real hardware fio benchmarks on NVMe partition `/dev/nvme0n1p5` (7.5 GiB) — run
-against ext4, XFS, and Btrfs on the **same physical device**:
+Real hardware fio benchmarks on NVMe partition `/dev/nvme0n1p5` (7.5 GiB) —
+run against ext4, XFS, and Btrfs on the **same physical device**
+(the local engine is unchanged from the 7.1 measurements):
 
-| Workload | 🦁 LionFS 7.1.0 | Best competitor | Winner |
+| Workload | 🦁 LionFS (local plane) | Best competitor | Winner |
 |---|---|---|---|
 | **Random Read 4K** | **304.86 MB/s / 78,044 IOPS / 12.6 µs** | ext4: 59.70 MB/s | 🦁 LionFS **5.1×** |
 | **Random Write 4K** | **103.83 MB/s / 26,581 IOPS** | Btrfs: 66.28 MB/s | 🦁 LionFS **+56.6%** |
@@ -24,9 +33,44 @@ against ext4, XFS, and Btrfs on the **same physical device**:
 | seq-read | 561 MB/s | XFS: 1,996 MB/s | XFS (FUSE context-switch bound) |
 
 LionFS includes per-block CRC32C checksums — the 12.6 µs rand-read latency
-already includes full end-to-end data integrity verification. ext4 and XFS have no per-block data checksums.
+already includes full end-to-end data integrity verification. ext4 and XFS
+have no per-block data checksums.
 
-See [`LFS_theory.md`](LFS_theory.md), [`comparison.md`](comparison.md), and [`docs/benchmarks.md`](docs/benchmarks.md) for full data.
+## What 8.0 adds on top of 7.1
+
+One command shows the whole merged capability set:
+
+```
+$ lfs_cluster
+=== 1. Raft consensus (3 nodes, deterministic) ===
+elected: node 0 is leader ... partitioned node 0 away: node 2 took over ...
+=== 2. CDC + convergent encryption + RS erasure coding ===
+payload 196608 bytes -> 31 chunks, 13 unique (2.45x dedup ratio)
+convergent encryption: same content -> same ciphertext: true ...
+RS stripe: 6 shards (k=4); destroying shards 1 and 4 ... byte-identical: true
+=== 3. Time travel (ClusterEngine volume) ===
+read at t1: "state at t1"   read at t2: "state at t2 (overwritten)"
+```
+
+* **`lion`** — the unified front-end (`lion info`, `lion guide`, `lion
+  mount`, plus git-style dispatch to all 52 tools).
+* **`lfs_timetravel`** — `resolve(path, t)`, `cat`/`ls`/`stat`/`diff` over
+  the local engine's frozen snapshot timeline.
+* **`lfs_dedupe` / `lfs_raid` / `lfs_verify` / `lfs_predict`** — four
+  former stubs are now real tools (CDC analysis with convergent keys,
+  RS erasure-coded fragment volumes, integrity verification, and
+  corrected MTTDL/write-amplification reliability prediction).
+* **`lionfs-cluster`** — the HelixFS distributed plane as a first-class
+  crate: Raft, CRDT, CDC dedup, convergent crypto, RS EC, WAL
+  checkpoint discipline, and the version-DAG engine.
+* **Two data-loss bugs fixed**: a concurrent-mount checkpoint race
+  (cluster plane) and a silent-fsync-loss-on-remount in the local
+  engine's grow-overwrite path (found by the new time-travel money
+  tests; see MERGE.md §4).
+
+See [`LFS_theory.md`](LFS_theory.md), [`comparison.md`](comparison.md),
+[`docs/benchmarks.md`](docs/benchmarks.md), and [`MERGE.md`](MERGE.md) for
+full data.
 
 
 ## Architecture at a glance

@@ -1,0 +1,16 @@
+[package]
+name = "lionfs-cli"
+version = "8.0.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT OR Apache-2.0"
+authors = ["LionFS Project"]
+description = "The unified `lion` front-end: built-ins (info, mount, guide) plus git-style dispatch to every lfs_* tool"
+
+[dependencies]
+lionfs = { path = "../lionfs" }
+lionfs-cluster = { path = "../lionfs-cluster" }
+
+[[bin]]
+name = "lion"
+path = "src/main.rs"

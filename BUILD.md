@@ -1,6 +1,14 @@
 # Building LionFS
 
-LionFS 2.0 builds from one code base on Linux, macOS, and Windows.
+LionFS 8.0 builds from one workspace on Linux, macOS, and Windows.
+
+## Workspace layout (8.0)
+
+```
+crates/lionfs          the local engine (lib lionfs_core, 52 tools)   MSRV 1.83
+crates/lionfs-cluster  the distributed plane (lib lionfs_cluster)     MSRV 1.89 (std file locking)
+crates/lionfs-cli      the `lion` front-end
+```
 
 ## Toolchain decision at a glance
 
@@ -12,7 +20,7 @@ flowchart TB
     OS -->|"Windows"| WIN["Portable build (MSVC, zero external crates)"]
     LF -->|"yes"| FAST["cargo build --features io_uring (graceful fallback if the kernel refuses the ring)"]
     LF -->|"no"| PORT["Portable build (threaded backend)"]
-    FAST --> TEST["cargo test (713 tests as of 3.1)"]
+    FAST --> TEST["cargo test --workspace (948+ tests as of 8.0)"]
     PORT --> TEST
     MAC --> TEST
     WIN --> TEST
@@ -21,8 +29,9 @@ flowchart TB
 
 ## Prerequisites
 
-- **Rust** 1.75+ (`rustup` recommended). The toolchain is pinned as a
-  floor in `Cargo.toml` (`rust-version`).
+- **Rust** 1.89+ for the full workspace (`lionfs-cluster` uses std file
+  locking, stabilized in 1.89; the engine crate floors at 1.83 —
+  `ErrorKind::NotADirectory`, used de-facto since 7.1's xattr.rs).
 - **Linux**: nothing else for the default build. FUSE *mounting*
   needs `libfuse` for the kernel side (distro package `fuse3` or
   `libfuse-dev`); `cargo test` does not need it.
@@ -36,11 +45,20 @@ flowchart TB
 ```bash
 cargo build --release                        # portable, every OS
 cargo build --release --features io_uring   # Linux fast path
-cargo test                                  # 462 tests, every OS
-cargo test --features io_uring              # same suite + ring tests
-cargo clippy --lib --bins -- -D warnings    # lint gate (CI parity)
-cargo fmt                                   # format
-cargo bench                                 # criterion benches
+cargo test --workspace                       # 948+ tests, every OS
+cargo test -p lionfs --features io_uring     # engine suite + ring tests
+cargo clippy --lib --bins -- -D warnings     # lint gate (CI parity)
+cargo fmt                                    # format
+cargo bench                                  # criterion benches
+```
+
+Quick tour after building:
+
+```bash
+./target/debug/lion guide                # the capability map
+./target/debug/lfs_cluster               # the merged-plane showcase
+mkfs_lfs /tmp/vol.img 64                 # format
+./target/debug/lion mount /tmp/vol.img /mnt/point   # FUSE mount
 ```
 
 ## Feature flags
